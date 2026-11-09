@@ -30,7 +30,6 @@ export const seedFiles = sdk.setupOnInit(async (effects) => {
     await storeJson.write(effects, {
       node: null,
       indexer: null,
-      rebuildIndex: false,
     })
   }
 })

@@ -5,9 +5,8 @@ import { sdk } from '../sdk'
 
 /**
  * StartOS-side state, beside Frigate's own config.toml:
- *   - node, indexer: the Select Node and Select Indexer choices (null until made);
- *   - rebuildIndex: set by Configure Frigate; main deletes the index before the next start, then
- *     clears it.
+ *   - node, indexer: the Select Node and Select Indexer choices (null until made).
+ * A pending Rebuild Index is a marker file instead (utils.ts, rebuildRequest).
  */
 const shape = z.object({
   node: z
@@ -18,7 +17,6 @@ const shape = z.object({
     .enum(indexerIds as [IndexerId, ...IndexerId[]])
     .nullable()
     .catch(null),
-  rebuildIndex: z.boolean().catch(false),
 })
 
 export const storeJson = FileHelper.json(

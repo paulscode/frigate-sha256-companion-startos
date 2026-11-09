@@ -14,5 +14,13 @@ export const frigateHome = '/root/.frigate'
 export const dbDirOnVolume = sdk.volumes.main.subpath('db')
 export const startHeightFile = sdk.volumes.main.subpath('db/start-height')
 
+/**
+ * Left by Configure Frigate's Rebuild Index, consumed by `main` at its next start: an empty file at
+ * the volume root. `main` removes it only after the index is gone, so an interrupted delete repeats.
+ * A file rather than a store.json field, because main must not watch it: clearing a watched value
+ * from main restarts main while it is still starting.
+ */
+export const rebuildRequest = sdk.volumes.main.subpath('rebuild.request')
+
 /** Frigate's mainnet default: Taproot activation, where Silent Payments become possible. */
 export const taprootActivationHeight = 709632

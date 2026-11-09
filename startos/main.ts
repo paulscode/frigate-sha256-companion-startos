@@ -1,4 +1,5 @@
 import { manifest as bitcoinManifest } from 'bitcoin-core-startos/startos/manifest'
+import { existsSync } from 'fs'
 import { readFile, rm } from 'fs/promises'
 import { StringDecoder } from 'string_decoder'
 import {
@@ -14,6 +15,7 @@ import {
   dbDirOnVolume,
   electrumPort,
   frigateHome,
+  rebuildRequest,
   startHeightFile,
 } from './utils'
 
@@ -37,10 +39,10 @@ export const main = sdk.setupMain(async ({ effects }) => {
 
   // Rebuild Index (Configure Frigate): the index and its start-height record go; Frigate builds a
   // new one from the start height, or from the node's prune height on a pruned node.
-  if (await storeJson.read((s) => s.rebuildIndex).const(effects)) {
+  if (existsSync(rebuildRequest)) {
     console.warn('Rebuild Index requested: deleting the Silent Payments index')
     await rm(dbDirOnVolume, { recursive: true, force: true })
-    await storeJson.merge(effects, { rebuildIndex: false })
+    await rm(rebuildRequest, { force: true })
   }
 
   // The node's RPC over the LXC bridge: its btc-rpc-proxy when it prunes. Null while the node is

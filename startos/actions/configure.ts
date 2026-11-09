@@ -1,8 +1,8 @@
 import { config, isCacheSize } from '../fileModels/config.toml'
-import { storeJson } from '../fileModels/store.json'
+import { writeFile } from 'fs/promises'
 import { i18n } from '../i18n'
 import { sdk } from '../sdk'
-import { taprootActivationHeight } from '../utils'
+import { rebuildRequest, taprootActivationHeight } from '../utils'
 
 const { InputSpec, Value } = sdk
 
@@ -95,10 +95,17 @@ export const configure = sdk.Action.withInput(
   async ({ effects, input }) => {
     // Frigate never moves an existing index's start: a lower height is ignored and a higher one
     // leaves a gap. So a new start height means a new index.
-    const previous = await config.read((c) => c.index.startHeight).once()
+    const before = await config.read().once()
     const rebuild =
       input.rebuildIndex ||
-      (previous !== undefined && previous !== input.indexStartHeight)
+      (before !== null && before.index.startHeight !== input.indexStartHeight)
+    if (rebuild) await writeFile(rebuildRequest, '')
+    const changed =
+      !before ||
+      before.index.startHeight !== input.indexStartHeight ||
+      before.index.cacheSize !== input.scriptPubKeyCacheSize ||
+      before.scan.computeBackend !== input.computeBackend ||
+      before.scan.batchSize !== input.batchSize
     await config.merge(effects, {
       index: {
         startHeight: input.indexStartHeight,
@@ -109,6 +116,27 @@ export const configure = sdk.Action.withInput(
         batchSize: input.batchSize,
       },
     })
-    if (rebuild) await storeJson.merge(effects, { rebuildIndex: true })
+    // A changed setting restarts Frigate by itself (main watches them). A rebuild alone changes
+    // nothing main watches, so restart it here, the way Fulcrum Pruned's Reindex does: wait out a
+    // start in progress, and ask twice if it is still starting, since one request mid-start is
+    // dropped.
+    if (rebuild && !changed) {
+      let status = await sdk.getStatus(effects).once()
+      for (
+        let i = 0;
+        i < 60 && status?.desired.main === 'running' && !status.started;
+        i++
+      ) {
+        await new Promise((resolve) => setTimeout(resolve, 1_000))
+        status = await sdk.getStatus(effects).once()
+      }
+      if (
+        status?.desired.main === 'running' ||
+        status?.desired.main === 'restarting'
+      ) {
+        await sdk.restart(effects)
+        if (!status.started) await sdk.restart(effects)
+      }
+    }
   },
 )
