@@ -40,16 +40,17 @@ WORKDIR /src/frigate
 # A patch that does not apply exactly is a build failure, never a fuzzy guess.
 RUN set -e; ls /tmp/patches/*.patch >/dev/null; \
     for p in /tmp/patches/*.patch; do echo "applying $p"; patch --strip=1 --fuzz=0 --forward < "$p"; done
+# Gradle itself (the zip is the same for every target), fetched once here and retried for several
+# minutes: GitHub's release downloads fail now and then (504), and that should not fail a release.
+RUN for i in $(seq 1 12); do ./gradlew --no-daemon --version >/dev/null && exit 0; echo "gradle download failed, retrying"; sleep 30; done; exit 1
 
 FROM eclipse-temurin:25-jdk@sha256:83f4a7fc27df94dcc7b8de04d14cbbba8da14406f921e966969c3b09000aa507 AS builder
 COPY --from=sources /src/frigate /src/frigate
+COPY --from=sources /root/.gradle/wrapper /root/.gradle/wrapper
 WORKDIR /src/frigate
 # The launcher script runs bin/java, which jlink's --strip-native-commands would leave out.
 RUN grep --quiet --fixed-strings "'--strip-native-commands'" build.gradle \
     && sed --in-place "s/'--strip-native-commands', //" build.gradle
-# Gradle itself, fetched first and retried: GitHub's release downloads fail now and then (504), and
-# that should not fail a release build.
-RUN for i in 1 2 3 4 5; do ./gradlew --no-daemon --version >/dev/null && exit 0; echo "gradle download failed, retrying"; sleep 20; done; exit 1
 # The tests run on the native build only: under emulation they would take hours, and the code is the
 # same on both architectures.
 RUN if [ "$(uname -m)" = x86_64 ]; then ./gradlew --no-daemon clean test jlink; else ./gradlew --no-daemon clean jlink; fi
