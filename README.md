@@ -61,10 +61,11 @@ image's entrypoint and Intel OpenCL runtime. See `Dockerfile`.
 | 0004 | Electrum protocol 1.8 on a chain with v2 headers (refuse lower, as Electrs Pruned does), `blake2b_fork` in `server.features`, and a check that the backend follows the same chain |
 | 0005 | stop with `FATAL` when the index belongs to another chain than the node's (a node switched across the SHA256/BLAKE2b split), instead of rolling back 10 blocks and mixing the two chains' tweaks |
 | 0006 | stop indexing at the next block on shutdown, so a stop or update during a long index is prompt (the next start resumes) |
+| 0007 | `blockchain.transaction.get` falls back to the indexer for confirmed transactions (a pruned node has no `txindex`); fixes from review: backend always asked for `[1.4, 1.8]` on a v2 chain, no spurious `FATAL` after the node leaves IBD, the start record follows a moved start, a stop that needs a rebuild exits 3 and is held rather than restarted |
 
 | Property | Value |
 |---|---|
-| Image | built from `Dockerfile` over `ghcr.io/remcoros/frigate-docker:1.6.1` |
+| Image | built from `Dockerfile` over `ghcr.io/remcoros/frigate-docker:1.6.1`; sources are fetched and patched on the build platform, compiled per target |
 | Architectures | x86_64, aarch64 |
 | Entrypoint | the base image's, `frigate -n "$NETWORK"`, after waiting for the node's cookie |
 

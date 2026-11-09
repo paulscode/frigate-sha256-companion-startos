@@ -16,6 +16,7 @@ import {
   electrumPort,
   frigateHome,
   rebuildRequest,
+  recentBlocksFile,
   startHeightFile,
 } from './utils'
 
@@ -42,6 +43,8 @@ export const main = sdk.setupMain(async ({ effects }) => {
   if (existsSync(rebuildRequest)) {
     console.warn('Rebuild Index requested: deleting the Silent Payments index')
     await rm(dbDirOnVolume, { recursive: true, force: true })
+    // The hashes of the last indexed blocks, which the next index must not be checked against.
+    await rm(recentBlocksFile, { force: true })
     await rm(rebuildRequest, { force: true })
   }
 
@@ -185,13 +188,24 @@ export const main = sdk.setupMain(async ({ effects }) => {
               'sh',
               '-c',
               // Frigate stops at once without the node's cookie, so wait for it (the node starting,
-              // or not yet installed), then run the image's own entrypoint.
+              // or not yet installed), then run the image's own entrypoint, passing a stop on to it.
               `for i in $(seq 1 300); do
   [ -r /root/.bitcoin/.cookie ] && break
   [ "$i" = 1 ] && echo "Waiting for the node's RPC cookie"
   sleep 1
 done
-exec /usr/local/bin/docker-entrypoint.sh`,
+/usr/local/bin/docker-entrypoint.sh &
+pid=$!
+trap 'kill -TERM "$pid" 2>/dev/null; wait "$pid"; exit 0' TERM INT
+wait "$pid"; rc=$?
+# 3: a stop that restarting cannot fix (a block the index needs was pruned, or the index belongs to
+# another chain). Hold here rather than restart into the same stop every 30 seconds, so the FATAL
+# line stays the health message until Rebuild Index restarts the service.
+if [ "$rc" = 3 ]; then
+  echo "Frigate has stopped and will not restart by itself. Run Configure Frigate with Rebuild Index on."
+  while true; do sleep 3600 & wait $!; done
+fi
+exit "$rc"`,
             ],
             env: { NETWORK: 'mainnet' },
             onStdout: (chunk) => stdout(chunk, console.log),

@@ -6,7 +6,10 @@
 # commit and by the SHA256 of GitHub's archive of that commit. UPDATING.md says how to move a pin.
 ARG BASE_IMAGE=ghcr.io/remcoros/frigate-docker:1.6.1@sha256:218cc79bdcd300651f516d3e40ae43dcc48763329f223133c9d606f039c22f8b
 
-FROM eclipse-temurin:25-jdk@sha256:83f4a7fc27df94dcc7b8de04d14cbbba8da14406f921e966969c3b09000aa507 AS builder
+# Sources: downloaded, verified, unpacked and patched on the build machine's own architecture. They
+# are the same for every target, and unpacking under emulation fails on some hosts (tar: "Cannot
+# mkdir: Function not implemented" in an arm64 build on x86_64).
+FROM --platform=$BUILDPLATFORM eclipse-temurin:25-jdk@sha256:83f4a7fc27df94dcc7b8de04d14cbbba8da14406f921e966969c3b09000aa507 AS sources
 
 # sparrowwallet/frigate tag 1.6.1
 ARG FRIGATE_COMMIT=f516f285f4f684328a867ea906267ba766f0b2c6
@@ -37,6 +40,10 @@ WORKDIR /src/frigate
 # A patch that does not apply exactly is a build failure, never a fuzzy guess.
 RUN set -e; ls /tmp/patches/*.patch >/dev/null; \
     for p in /tmp/patches/*.patch; do echo "applying $p"; patch --strip=1 --fuzz=0 --forward < "$p"; done
+
+FROM eclipse-temurin:25-jdk@sha256:83f4a7fc27df94dcc7b8de04d14cbbba8da14406f921e966969c3b09000aa507 AS builder
+COPY --from=sources /src/frigate /src/frigate
+WORKDIR /src/frigate
 # The launcher script runs bin/java, which jlink's --strip-native-commands would leave out.
 RUN grep --quiet --fixed-strings "'--strip-native-commands'" build.gradle \
     && sed --in-place "s/'--strip-native-commands', //" build.gradle

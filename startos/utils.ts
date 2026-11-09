@@ -13,6 +13,8 @@ export const frigateHome = '/root/.frigate'
  */
 export const dbDirOnVolume = sdk.volumes.main.subpath('db')
 export const startHeightFile = sdk.volumes.main.subpath('db/start-height')
+/** Frigate's record of the last indexed blocks' hashes, kept beside db/; cleared with the index. */
+export const recentBlocksFile = sdk.volumes.main.subpath('recentblocks')
 
 /**
  * Left by Configure Frigate's Rebuild Index, consumed by `main` at its next start: an empty file at
