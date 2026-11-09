@@ -51,3 +51,8 @@ FROM ${BASE_IMAGE}
 # Replace the stock application wholesale, so nothing of upstream's .deb build lingers beside ours.
 RUN rm -rf /opt/frigate
 COPY --from=builder /src/frigate/build/image /opt/frigate
+# The jlink launcher runs java as a child of its shell, so a stop signal reaches only the shell and
+# Frigate keeps running (a StartOS stop or update then waits on it). exec hands the process to java.
+RUN grep -q '^"\$DIR/java" ' /opt/frigate/bin/frigate \
+    && sed -i 's|^"\$DIR/java" |exec "$DIR/java" |' /opt/frigate/bin/frigate \
+    && grep -q '^exec "\$DIR/java" ' /opt/frigate/bin/frigate
