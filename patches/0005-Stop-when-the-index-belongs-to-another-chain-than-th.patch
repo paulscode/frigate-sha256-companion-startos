@@ -1,0 +1,111 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Paul Lamb <paul@paulscode.com>
+Date: Mon, 9 Nov 2026 00:23:06 -0600
+Subject: [PATCH 5/5] Stop when the index belongs to another chain than the
+ node's
+
+On start, a stored block hash that no longer matches the node was always
+treated as a reorg: roll back ten blocks and index again. That is right
+for a reorg, and wrong when the node itself has changed chain under the
+index (a node switched between the SHA256 and BLAKE2b chains, which share
+every block below 961640). The rollback then leaves the other chain's
+tweaks in the index, answering wallets with payments that never happened
+on this chain.
+
+recentblocks keeps the hashes of the last ten indexed blocks. If the node
+disagrees even at the oldest of them, or has no block at that height, the
+divergence is deeper than any rollback Frigate makes, and it stops with a
+FATAL line asking for the index to be rebuilt. A shallow reorg is handled
+as before.
+
+An index ahead of the node's tip, which is how a switch to a shorter
+chain looks, no longer fails in getblockhash with "Block height out of
+range": a height the node does not have counts as a mismatch.
+---
+ .../java/com/sparrowwallet/frigate/Frigate.java  |  2 +-
+ .../frigate/bitcoind/BitcoindClient.java         | 16 ++++++++++++++--
+ .../frigate/bitcoind/ChainMismatchException.java | 12 ++++++++++++
+ .../frigate/io/RecentBlocksMap.java              | 10 ++++++++++
+ 4 files changed, 37 insertions(+), 3 deletions(-)
+ create mode 100644 src/main/java/com/sparrowwallet/frigate/bitcoind/ChainMismatchException.java
+
+diff --git a/src/main/java/com/sparrowwallet/frigate/Frigate.java b/src/main/java/com/sparrowwallet/frigate/Frigate.java
+index 7020b72..f1a7be3 100644
+--- a/src/main/java/com/sparrowwallet/frigate/Frigate.java
++++ b/src/main/java/com/sparrowwallet/frigate/Frigate.java
+@@ -217,7 +217,7 @@ public class Frigate {
+             frigate.start();
+         } catch(Exception e) {
+             String message = getOperationalErrorMessage(e);
+-            if(e instanceof com.sparrowwallet.frigate.bitcoind.PrunedBlockException) {
++            if(e instanceof com.sparrowwallet.frigate.bitcoind.PrunedBlockException || e instanceof com.sparrowwallet.frigate.bitcoind.ChainMismatchException) {
+                 getLogger().error("FATAL: " + e.getMessage());
+             } else if(message != null) {
+                 getLogger().error(message);
+diff --git a/src/main/java/com/sparrowwallet/frigate/bitcoind/BitcoindClient.java b/src/main/java/com/sparrowwallet/frigate/bitcoind/BitcoindClient.java
+index d9ea085..b9fae88 100644
+--- a/src/main/java/com/sparrowwallet/frigate/bitcoind/BitcoindClient.java
++++ b/src/main/java/com/sparrowwallet/frigate/bitcoind/BitcoindClient.java
+@@ -187,9 +187,21 @@ public class BitcoindClient {
+         int markerHeight = blocksIndex.getLastBlockIndexed();
+         byte[] storedHash = blocksIndex.getLastBlockHash();
+         if(markerHeight > 0 && storedHash != null) {
+-            String currentHashHex = getBitcoindService().getBlockHash(markerHeight);
+-            byte[] currentHash = Sha256Hash.wrap(currentHashHex).getBytes();
++            //the node has synced by now, so an index ahead of it was built on another chain (getblockhash would refuse the height)
++            int nodeHeight = blockchainInfo.blocks();
++            byte[] currentHash = markerHeight <= nodeHeight ? Sha256Hash.wrap(getBitcoindService().getBlockHash(markerHeight)).getBytes() : null;
+             if(!Arrays.equals(storedHash, currentHash)) {
++                //a reorg replaces at most the last few blocks; the hashes of the last MAX_REORG_DEPTH indexed blocks are kept in
++                //recentblocks. If the node disagrees even at the oldest of them, this is not a reorg the rollback below can repair: the
++                //node is on another chain than the one indexed (the SHA256 and BLAKE2b chains share every block below 961640), and
++                //rolling back a few blocks would leave the other chain's tweaks in the index, answering wallets with payments that
++                //never happened here
++                Integer oldest = recentBlocksMap.getOldestHeight();
++                String oldestHash = oldest == null ? null : recentBlocksMap.get(oldest);
++                if(oldest != null && oldest < markerHeight && oldestHash != null
++                        && (oldest > nodeHeight || !oldestHash.equals(getBitcoindService().getBlockHash(oldest)))) {
++                    throw new ChainMismatchException(oldest);
++                }
+                 int rollbackTo = Math.max(0, markerHeight - MAX_REORG_DEPTH);
+                 log.info("Stored block hash at height {} does not match bitcoind - rolling back to height {} and re-indexing", markerHeight, rollbackTo);
+                 blocksIndex.removeFromIndex(rollbackTo + 1);
+diff --git a/src/main/java/com/sparrowwallet/frigate/bitcoind/ChainMismatchException.java b/src/main/java/com/sparrowwallet/frigate/bitcoind/ChainMismatchException.java
+new file mode 100644
+index 0000000..288fe77
+--- /dev/null
++++ b/src/main/java/com/sparrowwallet/frigate/bitcoind/ChainMismatchException.java
+@@ -0,0 +1,12 @@
++package com.sparrowwallet.frigate.bitcoind;
++
++/**
++ * The index was built on a different chain from the one the node now follows: the node disagrees with blocks deeper than any reorg
++ * Frigate rolls back. Stops Frigate rather than mix two chains' tweaks in one index.
++ */
++public class ChainMismatchException extends RuntimeException {
++    public ChainMismatchException(int height) {
++        super("The node's block at height " + height + " is not the one this index was built from: the index belongs to another chain "
++                + "than the node now follows, or to a reorganization deeper than Frigate can roll back. Rebuild the index.");
++    }
++}
+diff --git a/src/main/java/com/sparrowwallet/frigate/io/RecentBlocksMap.java b/src/main/java/com/sparrowwallet/frigate/io/RecentBlocksMap.java
+index a9e3de6..8c1a2eb 100644
+--- a/src/main/java/com/sparrowwallet/frigate/io/RecentBlocksMap.java
++++ b/src/main/java/com/sparrowwallet/frigate/io/RecentBlocksMap.java
+@@ -55,6 +55,16 @@ public class RecentBlocksMap {
+         return data.firstKey();
+     }
+ 
++    /**
++     * @return the lowest height recorded, the deepest block a mismatch can be checked against
++     */
++    public synchronized Integer getOldestHeight() {
++        if(data.isEmpty()) {
++            return null;
++        }
++        return data.lastKey();
++    }
++
+     private void enforceMaxSize() {
+         while(data.size() > maxSize) {
+             data.pollLastEntry();

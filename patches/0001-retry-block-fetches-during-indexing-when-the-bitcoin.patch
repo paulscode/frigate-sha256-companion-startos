@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Craig Raw <craigraw@gmail.com>
 Date: Fri, 30 Oct 2026 17:26:31 +0200
-Subject: [PATCH 1/4] retry block fetches during indexing when the bitcoind
+Subject: [PATCH 1/5] retry block fetches during indexing when the bitcoind
  connection drops or returns a non-json error
 
 (cherry picked from commit bee70a9ec20bb1c518edd2544cce2945ce5419ed)

@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Craig Raw <craigraw@gmail.com>
 Date: Mon, 19 Oct 2026 09:13:42 -0700
-Subject: [PATCH 2/4] send notifications without an id and document silent
+Subject: [PATCH 2/5] send notifications without an id and document silent
  payments notification params as positional
 
 (cherry picked from commit 92518bb4811a52ef65cdcef29a741d59aed7d56b)

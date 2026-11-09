@@ -59,6 +59,7 @@ image's entrypoint and Intel OpenCL runtime. See `Dockerfile`.
 | 0002 | upstream (post-1.6.1): notifications without an id |
 | 0003 | serve the node's raw tip header (164 bytes on BLAKE2b); index a pruned node with `getblock` verbosity 3; mempool prevouts from `gettxout` (no `txindex`); start a new index at the node's prune height; stop with `FATAL` when a needed block has been pruned |
 | 0004 | Electrum protocol 1.8 on a chain with v2 headers (refuse lower, as Electrs Pruned does), `blake2b_fork` in `server.features`, and a check that the backend follows the same chain |
+| 0005 | stop with `FATAL` when the index belongs to another chain than the node's (a node switched across the SHA256/BLAKE2b split), instead of rolling back 10 blocks and mixing the two chains' tweaks |
 
 | Property | Value |
 |---|---|
@@ -168,6 +169,8 @@ The volume is backed up except `db/` (the index) and `frigate.log`. A restore re
    height is not implemented yet.
 2. **If the node prunes past the index while Frigate is stopped,** Frigate stops with a `FATAL`
    message rather than skipping blocks; Rebuild Index starts a new index.
+   The same happens if the selected node is switched to one on the other chain: the old index
+   cannot be reused.
 3. **On the BLAKE2b chain** wallets must speak Electrum protocol 1.8 (the Sparrow BLAKE2b fork
    does); older wallets are refused with a reason. `server.features` carries `blake2b_fork`.
 4. Only the generic image (CPU, recent Intel iGPU). No NVIDIA or AMD builds.
