@@ -1,29 +1,26 @@
 import { config, isCacheSize } from '../fileModels/config.toml'
-import { readFile, writeFile } from 'fs/promises'
-import { chain } from '../chain'
+import { writeFile } from 'fs/promises'
 import { i18n } from '../i18n'
 import { sdk } from '../sdk'
 import {
+  blake2bChainSplit,
   rebuildRequest,
-  startHeightFile,
+  startHeightRecord,
   taprootActivationHeight,
 } from '../utils'
 
 const { InputSpec, Value } = sdk
 
 /**
- * Look Back for Payments, as offered: off, the chain split (on the BLAKE2b app), Taproot
- * activation, or a block of the user's choosing. Frigate keeps only the block (index.backfillFromHeight).
+ * Look Back for Payments, as offered: off, the BLAKE2b chain split, Taproot activation, or a block of
+ * the user's choosing. Either app can follow either chain, so both offer the split (on the SHA256
+ * chain it is just a block). Frigate keeps only the block (index.backfillFromHeight).
  */
 const lookBackValues: Record<string, string> = {
   off: i18n('Off (default)'),
-  ...(chain.chainSplit !== null
-    ? {
-        split: i18n('Back to the chain split (block ${block})', {
-          block: String(chain.chainSplit),
-        }),
-      }
-    : {}),
+  split: i18n('Back to the BLAKE2b chain split (block ${block})', {
+    block: String(blake2bChainSplit),
+  }),
   taproot: i18n('Back to Taproot activation (block ${block})', {
     block: String(taprootActivationHeight),
   }),
@@ -34,7 +31,7 @@ const lookBackChoice = (
   height: number | undefined,
 ): { lookBack: string; lookBackHeight: number | null } => {
   if (height === undefined) return { lookBack: 'off', lookBackHeight: null }
-  if (chain.chainSplit !== null && height === chain.chainSplit)
+  if (height === blake2bChainSplit)
     return { lookBack: 'split', lookBackHeight: null }
   if (height === taprootActivationHeight)
     return { lookBack: 'taproot', lookBackHeight: null }
@@ -45,7 +42,7 @@ const inputSpec = InputSpec.of({
   indexStartHeight: Value.number({
     name: i18n('Index Start Height'),
     description: i18n(
-      'Blocks below this height are not indexed, so Silent Payments in them are not found. The default is Taproot activation (709632), the first block where Silent Payments are possible. On a pruned node, a new index starts at the oldest block the node still holds instead, because the node has discarded what it needs for older ones; a larger prune target on the node reaches further back. Changing this rebuilds the index.',
+      'Blocks below this height are not indexed, so Silent Payments in them are not found. The default is Taproot activation (709632), the first block where Silent Payments are possible. On a pruned node, a new index starts a few blocks above the oldest block the node still holds instead, because the node has discarded what it needs for older ones; a larger prune target on the node reaches further back. Changing this rebuilds the index.',
     ),
     required: true,
     integer: true,
@@ -56,19 +53,14 @@ const inputSpec = InputSpec.of({
   rebuildIndex: Value.toggle({
     name: i18n('Rebuild Index'),
     description: i18n(
-      "Delete the Silent Payments index and build it again on the next start, from the start height above (or the node's prune height on a pruned node). Use it after the node pruned blocks this index still needed, or to start from a different height. Wallets connected meanwhile see only what has been indexed so far.",
+      "Delete the Silent Payments index and build it again on the next start, from the start height above (or the node's prune height on a pruned node). Use it after the node pruned blocks this index still needed, or to start from a different height. Wallets connected meanwhile see only what has been indexed so far. If Look Back for Payments is on, the new index looks back again, at the same cost as the first time.",
     ),
     default: false,
   }),
   lookBack: Value.select({
     name: i18n('Look Back for Payments'),
     description: i18n(
-      'Also find Silent Payments in blocks below where the index starts, which a pruned node has already discarded. Frigate fetches each of those blocks from peers, and the coins its transactions spend through the indexer, checking both against the node. It is done once and covers every wallet, wallets connected meanwhile are told what it finds, and changing this does not rebuild the index. It costs download traffic and time, roughly per 1,000 blocks: ${traffic} GB, and ${full} at full speed or ${background} in the background. Choose the oldest block your wallets need: the further back, the longer it takes.',
-      {
-        traffic: chain.backfillCost.trafficGb,
-        full: chain.backfillCost.full,
-        background: chain.backfillCost.background,
-      },
+      "Also find Silent Payments in blocks below where the index starts, which a pruned node has already discarded. Frigate fetches each of those blocks from the node's peers and checks it against the node, and looks up the coins its transactions spend through the indexer, checking each against its transaction id. It is done once and covers every wallet, wallets connected meanwhile are told what it finds, and changing this does not rebuild the index. It costs download traffic and time, roughly per 1,000 blocks: on the SHA256 chain 40 to 250 GB, and 5 to 30 hours at full speed or 1 to 5 days in the background; on the BLAKE2b chain since the split 15 to 120 GB, and 2 to 15 hours or 8 to 60 hours. Blocks before the split cost as on the SHA256 chain. The range is wide because it depends on how many old coins the transactions spend. Look back no further than your wallets need.",
     ),
     values: lookBackValues,
     default: 'off',
@@ -137,11 +129,12 @@ const inputSpec = InputSpec.of({
 export const configure = sdk.Action.withInput(
   'config',
 
-  async () => ({
+  async ({ effects }) => ({
     name: i18n('Configure Frigate'),
     description: await (async () => {
+      // Watched, so the text follows a rebuild or a finished look back
       const start = (
-        await readFile(startHeightFile, 'utf8').catch(() => '')
+        (await startHeightRecord.read().const(effects)) ?? ''
       ).trim()
       const what = i18n(
         'Index start height, rebuilding the index, looking back for older payments, and scanning performance.',
@@ -179,8 +172,8 @@ export const configure = sdk.Action.withInput(
     const backfillFromHeight =
       input.lookBack === 'off'
         ? undefined
-        : input.lookBack === 'split' && chain.chainSplit !== null
-          ? chain.chainSplit
+        : input.lookBack === 'split'
+          ? blake2bChainSplit
           : input.lookBack === 'taproot'
             ? taprootActivationHeight
             : (input.lookBackHeight ?? undefined)

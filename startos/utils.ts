@@ -1,3 +1,4 @@
+import { FileHelper } from '@start9labs/start-sdk'
 import { sdk } from './sdk'
 
 // Host id Frigate binds its Electrum interface on, and the container port it listens on.
@@ -13,6 +14,11 @@ export const frigateHome = '/root/.frigate'
  */
 export const dbDirOnVolume = sdk.volumes.main.subpath('db')
 export const startHeightFile = sdk.volumes.main.subpath('db/start-height')
+/** The same record, watchable: Rebuild Index and a finished Look Back for Payments both rewrite it. */
+export const startHeightRecord = FileHelper.string({
+  base: sdk.volumes.main,
+  subpath: '/db/start-height',
+})
 /** Frigate's record of the last indexed blocks' hashes, kept beside db/; cleared with the index. */
 export const recentBlocksFile = sdk.volumes.main.subpath('recentblocks')
 
@@ -26,3 +32,5 @@ export const rebuildRequest = sdk.volumes.main.subpath('rebuild.request')
 
 /** Frigate's mainnet default: Taproot activation, where Silent Payments become possible. */
 export const taprootActivationHeight = 709632
+/** The first BLAKE2b block, where the BLAKE2b chain split from the SHA256 chain. */
+export const blake2bChainSplit = 961640

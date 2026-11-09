@@ -128,6 +128,9 @@ export const main = sdk.setupMain(async ({ effects }) => {
   let lastProgress: string | null = null
   let fatal: string | null = null
   let backendCheck: 'unknown' | 'same' | 'different' = 'unknown'
+  let waitingForCookie = false
+  // A look back that cannot run (before it has a block to look back to) or stopped on an error
+  let backfillNote: string | null = null
   // Look Back for Payments (the backfill), which runs once the index has caught up with the tip
   let backfillTarget: string | null = null
   let backfillProgress: string | null = null
@@ -138,7 +141,11 @@ export const main = sdk.setupMain(async ({ effects }) => {
     if (/Indexing \d+ blocks|Block index is up to date/.test(line))
       indexing = true
     if (line.includes('Waiting for sync to complete')) waitingForNodeSync = true
-    if (/Indexing \d+ blocks/.test(line)) waitingForNodeSync = false
+    if (/Indexing \d+ blocks|Block index is up to date/.test(line))
+      waitingForNodeSync = false
+    if (line.includes("Waiting for the node's RPC cookie"))
+      waitingForCookie = true
+    if (line.includes('Starting Frigate')) waitingForCookie = false
     const progress = /Indexing progress: (.+)/.exec(line)
     if (progress) {
       indexing = true
@@ -159,7 +166,13 @@ export const main = sdk.setupMain(async ({ effects }) => {
       backfillWaiting = null
     }
     const bfWaiting = /Backfill waiting: (.+)/.exec(line)
-    if (bfWaiting) backfillWaiting = bfWaiting[1].trim().slice(0, 300)
+    if (bfWaiting) {
+      backfillWaiting = bfWaiting[1].trim().slice(0, 300)
+      if (backfillTarget === null) backfillNote = backfillWaiting
+    }
+    const bfFailed =
+      /(Backfill could not start.*|Backfill stopped by an error.*)/.exec(line)
+    if (bfFailed) backfillNote = bfFailed[1].trim().slice(0, 300)
     if (
       /Backfill complete|Backfill stopping|Backfill stopped by an error/.test(
         line,
@@ -169,6 +182,7 @@ export const main = sdk.setupMain(async ({ effects }) => {
       backfillProgress = null
       backfillWaiting = null
     }
+    if (bfStart || /Backfill complete/.test(line)) backfillNote = null
     const f = /FATAL: (.+)/.exec(line)
     if (f) fatal = f[1].trim().slice(0, 400)
     if (line.includes('Backend chain check: the Electrum backend follows')) {
@@ -215,13 +229,21 @@ export const main = sdk.setupMain(async ({ effects }) => {
           backfillTarget = null
           backfillProgress = null
           backfillWaiting = null
+          backfillNote = null
+          waitingForNodeSync = false
+          waitingForCookie = false
+          backendCheck = 'unknown'
+          backendDetail = null
           return {
             command: [
               'sh',
               '-c',
               // Frigate stops at once without the node's cookie, so wait for it (the node starting,
               // or not yet installed), then run the image's own entrypoint, passing a stop on to it.
-              `for i in $(seq 1 300); do
+              // frigate.log is Frigate's own unrotated copy of what StartOS already captures: cap it.
+              `f=/root/.frigate/frigate.log
+[ -f "$f" ] && [ "$(wc -c < "$f")" -gt 52428800 ] && : > "$f"
+for i in $(seq 1 300); do
   [ -r /root/.bitcoin/.cookie ] && break
   [ "$i" = 1 ] && echo "Waiting for the node's RPC cookie"
   sleep 1
@@ -255,6 +277,14 @@ exit "$rc"`,
           if (!rpc) {
             return { result: 'starting', message: i18n('Waiting for the node') }
           }
+          if (waitingForCookie) {
+            return {
+              result: 'starting',
+              message: i18n('Waiting for ${node} to start', {
+                node: node.title,
+              }),
+            }
+          }
           if (indexing || waitingForNodeSync) {
             return {
               result: 'loading',
@@ -283,7 +313,11 @@ exit "$rc"`,
             // Wallets are served throughout a backfill, so it reports as success
             const lookingBack =
               backfillTarget === null
-                ? null
+                ? backfillNote
+                  ? i18n('Looking back for payments: ${note}', {
+                      note: backfillNote,
+                    })
+                  : null
                 : backfillWaiting
                   ? i18n(
                       'Looking back to block ${target} is waiting: ${reason}',
@@ -329,6 +363,15 @@ exit "$rc"`,
       ready: {
         display: i18n('Indexer'),
         fn: async () => {
+          if (!backend) {
+            return {
+              result: 'starting',
+              message: i18n(
+                '${indexer} is not reachable: install it, or start it, or choose another with Select Indexer',
+                { indexer: indexer.title },
+              ),
+            }
+          }
           if (backendCheck === 'same') {
             return {
               result: 'success',

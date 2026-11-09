@@ -1,4 +1,4 @@
-# Frigate (SHA256) Companion
+# Frigate Electrum Server (SHA256) Companion
 
 ## Documentation
 
@@ -10,7 +10,7 @@
 
 An Electrum server that scans the blockchain for Silent Payments on your wallet's behalf, without learning which payments are yours. Point a Silent Payments wallet at its Electrum address and it can find its incoming payments without downloading the chain itself.
 
-This companion runs beside the official Frigate, works with a **pruned** node, and needs no `txindex`. It follows whichever Bitcoin node you select, on the SHA256 chain or the BLAKE2b chain. It is named for the SHA256 chain, the pairing it is meant for; its twin, Frigate (BLAKE2b) Companion, lets one server run Frigate for each chain.
+This companion runs beside the official Frigate, works with a **pruned** node, and needs no `txindex`. It follows whichever Bitcoin node you select, on the SHA256 chain or the BLAKE2b chain. It is named for the SHA256 chain, the pairing it is meant for; its twin, Frigate Electrum Server (BLAKE2b) Companion, lets one server run Frigate for each chain.
 
 Frigate answers Silent Payments queries itself and passes everything else, ordinary address lookups included, to an **indexer**: Electrs Pruned or Fulcrum Pruned (Electrs or Fulcrum also work with an archival node).
 
@@ -26,10 +26,10 @@ Frigate answers Silent Payments queries itself and passes everything else, ordin
 
 Frigate finds Silent Payments made at or after the block its index starts from. **Sync Progress** shows that block once it is synced.
 
-- **On a pruned node** the index starts at the oldest block the node still holds, because the node has discarded what Frigate needs for older blocks. A larger prune target on the node keeps more blocks and so reaches further back: the node keeps as many recent blocks as fit in its prune target.
+- **On a pruned node** a new index starts a few blocks above the oldest block the node still holds, because the node has discarded what Frigate needs for older blocks. A larger prune target on the node keeps more blocks and so reaches further back: the node keeps as many recent blocks as fit in its prune target.
 - **On an archival node** it starts at Taproot activation (block 709632), where Silent Payments became possible, unless you set a later block in **Configure Frigate**. A later start makes the first index faster.
 
-Once indexed, a block stays in Frigate's index: pruning on the node later only limits where a *new* index can start. So on a pruned node, install Frigate early. On the BLAKE2b chain, a node that still holds the first BLAKE2b block (961640) gives an index that covers the whole BLAKE2b chain and keeps it.
+Once indexed, a block stays in Frigate's index: pruning on the node later only limits where a *new* index can start. So on a pruned node, install Frigate early. On the BLAKE2b chain, a node that still holds the blocks from a few before the first BLAKE2b block (961640) gives an index that covers every block since the split, and keeps it.
 
 Changing the start height rebuilds the index.
 
@@ -37,14 +37,20 @@ Changing the start height rebuilds the index.
 
 On a pruned node, **Configure Frigate** can also **Look Back for Payments** below where the index starts:
 
+- **Back to the BLAKE2b chain split** (block 961640): every block since the BLAKE2b chain split from the SHA256 chain. On the SHA256 chain it is just a block.
 - **Back to Taproot activation** (block 709632): every block where a Silent Payment is possible. On a pruned node this is a very large download; see below.
 - **Back to the block below**: a block you enter in **Look Back to Block**, such as your wallet's birthday.
 
-Frigate fetches each of those blocks from the node's peers, and the coins their transactions spend through your indexer, and checks both against the node, so it trusts neither. It is done once and covers every wallet: a wallet added later finds its payments in the same blocks. Wallets connected meanwhile are told about payments as they are found. **Sync Progress** shows how far it has got and roughly how long is left. A stop resumes where it left off, and changing the setting does not rebuild the index.
+Frigate fetches each of those blocks from the node's peers and checks it against the node, and looks up the coins their transactions spend through your indexer, checking each against its transaction id, so it trusts neither. It is done once and covers every wallet: a wallet added later finds its payments in the same blocks. Wallets connected meanwhile are told about payments as they are found. **Sync Progress** shows how far it has got and roughly how long is left. A stop resumes where it left off, and changing the setting does not rebuild the index.
 
-It costs download traffic and time. Roughly, per 1,000 blocks: about 40 to 160 GB of downloads, and 5 to 20 hours at full speed or 1 to 4 days in the background. **Look Back Speed** sets the pace: **Background** keeps a light load on the indexer, the network and the server; **Full speed** is several times faster. The traffic is the same either way, so on a metered connection choose the newest block your wallets need.
+It costs download traffic and time. Roughly, per 1,000 blocks:
 
-If Frigate is stopped for long enough that the node discards blocks the index still needs, Frigate stops and says so rather than skip them. Run **Configure Frigate** with **Rebuild Index** on, and it starts a new index from the node's current oldest block.
+- **SHA256 chain:** 40 to 250 GB, and 5 to 30 hours at full speed or 1 to 5 days in the background.
+- **BLAKE2b chain, since the split:** 15 to 120 GB, and 2 to 15 hours at full speed or 8 to 60 hours in the background. Blocks before the split cost as on the SHA256 chain.
+
+The range is wide because it depends on how many old coins the blocks' transactions spend. **Look Back Speed** sets the pace: **Background** keeps a light load on the indexer, the network and the server; **Full speed** is several times faster. The traffic is the same either way, so on a metered connection look back no further than your wallets need.
+
+If Frigate is stopped for long enough that the node discards blocks the index still needs, Frigate stops and says so rather than skip them. Run **Configure Frigate** with **Rebuild Index** on, and it starts a new index from the node's current oldest block. With Look Back for Payments on, the new index looks back again, at the same cost as the first time.
 
 ## The BLAKE2b chain
 

@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Paul Lamb <paul@paulscode.com>
 Date: Sun, 8 Nov 2026 23:26:55 -0600
-Subject: [PATCH 4/8] Electrum protocol 1.8 on a chain with v2 headers, and a
+Subject: [PATCH 4/9] Electrum protocol 1.8 on a chain with v2 headers, and a
  backend chain check
 
 On a chain whose tip is a v2 header (164 bytes, BLAKE2b proof of work),

@@ -18,8 +18,8 @@ from it in three ways: it works with a **pruned** node and never needs `txindex`
 **BLAKE2b** chain as well as the SHA256 one (it follows whichever node is selected); and it uses
 **Electrs Pruned** or **Fulcrum Pruned** as its Electrum backend. It is one of two companions,
 the other being Frigate Electrum Server (BLAKE2b) Companion (`frigate-blake2b-companion`); the two
-packages are identical except for their id, title, icon and the node they prefer at install, so a
-server can run one per chain.
+packages are identical except for their id, title, icon, ports and the node they prefer at install,
+so a server can run one per chain.
 
 - **Upstream repo:** <https://github.com/sparrowwallet/frigate>
 - **Wrapper repo:** <https://github.com/paulscode/frigate-sha256-companion-startos>
@@ -62,6 +62,8 @@ image's entrypoint and Intel OpenCL runtime. See `Dockerfile`.
 | 0005 | stop with `FATAL` when the index belongs to another chain than the node's (a node switched across the SHA256/BLAKE2b split), instead of rolling back 10 blocks and mixing the two chains' tweaks |
 | 0006 | stop indexing at the next block on shutdown, so a stop or update during a long index is prompt (the next start resumes) |
 | 0007 | `blockchain.transaction.get` falls back to the indexer for confirmed transactions (a pruned node has no `txindex`); fixes from review: backend always asked for `[1.4, 1.8]` on a v2 chain, no spurious `FATAL` after the node leaves IBD, the start record follows a moved start, a stop that needs a rebuild exits 3 and is held rather than restarted |
+| 0008 | Look Back for Payments: an opt-in backfill below the index's first block, oldest first, from blocks fetched from peers (checked against the node's header: hash, Merkle root, witness commitment) and prevouts looked up through the indexer (checked against their txid); resumes after a stop; connected wallets are scanned over each backfilled range |
+| 0009 | fixes from a review of the whole series: a node behind the index on the same chain is waited for; stale `recentblocks` cleared for a new index; the startup rollback stops at the index's first block; mempool prevouts through `gettxout` on any node without `txindex`; `server.features` reports Frigate's own protocol range off the BLAKE2b chain; the node's chain logged at start |
 
 | Property | Value |
 |---|---|
@@ -146,7 +148,7 @@ companion's (50032/50031). StartOS assigns the actual ports per server; never qu
 |---|---|
 | Select Node | which installed node Frigate follows |
 | Select Indexer | which Electrum server Frigate passes address lookups to |
-| Configure Frigate | start height, Rebuild Index, scriptPubKey cache, compute backend, batch size. A changed start height rebuilds the index, since Frigate never moves an existing index's start |
+| Configure Frigate | start height, Rebuild Index, Look Back for Payments (off, the BLAKE2b chain split 961640, Taproot activation 709632, or a chosen block) and Look Back Speed (background: 4 lookups in flight, or full: 32), scriptPubKey cache, compute backend, batch size. A changed start height rebuilds the index, since Frigate never moves an existing index's start; Look Back never rebuilds it |
 
 ## Tasks
 
@@ -158,18 +160,19 @@ above). Nothing is ever asked of the node.
 | Check | Meaning |
 |---|---|
 | Electrum Server (`primary`) | the Electrum port is listening (LISTEN state); loading while indexing; failure with Frigate's `FATAL` line |
-| Sync Progress (`sync-progress`) | index progress, and once synced the block it starts from; failure on `FATAL` (for example a block the node pruned while Frigate was stopped: run Rebuild Index) |
+| Sync Progress (`sync-progress`) | index progress, and once synced the block it starts from, plus Look Back progress (`Looking back to block N: ...`, or why it is waiting); failure on `FATAL` (for example a block the node pruned while Frigate was stopped: run Rebuild Index) |
 | Indexer (`indexer`) | the backend chain check: success when the indexer follows the node's chain, failure when it does not |
 
 ## Backups and Restore
 
-The volume is backed up except `db/` (the index) and `frigate.log`. A restore rebuilds the index.
+The volume is backed up except `db/` (the index), `frigate.log`, `recentblocks` and a pending `rebuild.request`. A restore rebuilds the index, and with Look Back for Payments on, the new index looks back again.
 
 ## Limitations and Differences
 
 1. **Pruned nodes index from the prune height.** Silent Payments received in blocks the node has
-   discarded are not found; a larger prune target reaches further back. A backfill below the prune
-   height is not implemented yet.
+   discarded are found only with **Look Back for Payments**, which costs download traffic and time
+   (roughly, per 1,000 blocks: 40 to 250 GB on the SHA256 chain, 15 to 120 GB on the BLAKE2b chain
+   since the split); a larger prune target reaches further back for free.
 2. **If the node prunes past the index while Frigate is stopped,** Frigate stops with a `FATAL`
    message rather than skipping blocks; Rebuild Index starts a new index.
    The same happens if the selected node is switched to one on the other chain: the old index
@@ -196,9 +199,11 @@ dependencies:
   indexer: one of electrs-pruned | fulcrum-pruned | electrs | fulcrum (Select Indexer)
 actions: [select-node, select-indexer, config]
 health_checks: [primary, sync-progress, indexer]
-backup_excludes: [/db, /frigate.log]
+backup_excludes: [/db, /frigate.log, /recentblocks, /rebuild.request]
 logs_to_watch:
   - "Silent Payments index starts at block N"
   - "Backend chain check: ..." / "Backend chain check FAILED: ..."
   - "FATAL: ..."
+  - "Node chain: BLAKE2b, 164 byte headers ..." / "Node chain: 80 byte headers ..."
+  - "Backfill: looking back to block N ..." / "Backfill progress: ..." / "Backfill waiting: ..." / "Backfill complete: the index now starts at block N"
 ```

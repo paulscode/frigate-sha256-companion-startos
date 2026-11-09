@@ -1,0 +1,240 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Paul Lamb <paul@paulscode.com>
+Date: Mon, 9 Nov 2026 10:11:24 -0600
+Subject: [PATCH 9/9] Fixes from a review of the whole series
+
+- clear recentblocks for an index with nothing indexed, so hashes left from a
+  deleted index cannot hide a reorg at the new tip
+- a node behind the index on the same chain (it knows the index's last block
+  among its headers) is waited for, not called another chain
+- the startup rollback stops at the index's first block
+- mempool prevouts through gettxout on any node without txindex, not only a
+  pruned one
+- headers.subscribe checks the tip it answers with; protocolVersion volatile
+- off a v2 chain, server.features reports this server's range, not the
+  backend's, and no fork point
+- log which chain the node is on (for packagers), and no 'backend configured'
+  warning for a blank backend
+---
+ .../frigate/bitcoind/BitcoindClient.java      | 47 +++++++++++++++++--
+ .../electrum/ElectrumServerService.java       | 27 ++++++++++-
+ .../frigate/io/RecentBlocksMap.java           |  7 +++
+ .../bitcoind/FutureWitnessProgramTest.java    | 29 ++++++++++++
+ 4 files changed, 105 insertions(+), 5 deletions(-)
+
+diff --git a/src/main/java/com/sparrowwallet/frigate/bitcoind/BitcoindClient.java b/src/main/java/com/sparrowwallet/frigate/bitcoind/BitcoindClient.java
+index 39e22b0..5bcf15b 100644
+--- a/src/main/java/com/sparrowwallet/frigate/bitcoind/BitcoindClient.java
++++ b/src/main/java/com/sparrowwallet/frigate/bitcoind/BitcoindClient.java
+@@ -183,12 +183,22 @@ public class BitcoindClient {
+ 
+         lastBlock = blockchainInfo.bestblockhash();
+         publishTip();
++        //for packagers: which chain the node is on, as its tip header shows it
++        log.info("Node chain: {} at the tip (block {})", isTipV2() ? "BLAKE2b, 164 byte headers" : "80 byte headers", tip.height());
+ 
+         blocksIndex.repairOrphanTweaks();
+ 
++        if(!blocksIndex.hasIndexedBlocks()) {
++            //hashes left from an index since deleted (a rebuild by hand) are not this index's: kept, the ones above the new tip would
++            //crowd out every block it records, and a reorg at the tip would go unseen
++            recentBlocksMap.clear();
++        }
++
+         int markerHeight = blocksIndex.getLastBlockIndexed();
+         byte[] storedHash = blocksIndex.getLastBlockHash();
+         if(markerHeight > 0 && storedHash != null) {
++            waitForNodeToReach(markerHeight, storedHash, blockchainInfo);
++            blockchainInfo = getBitcoindService().getBlockchainInfo();
+             //the node has synced by now, so an index ahead of it was built on another chain (getblockhash would refuse the height)
+             int nodeHeight = blockchainInfo.blocks();
+             byte[] currentHash = markerHeight <= nodeHeight ? Sha256Hash.wrap(getBitcoindService().getBlockHash(markerHeight)).getBytes() : null;
+@@ -204,7 +214,10 @@ public class BitcoindClient {
+                         && (oldest > nodeHeight || !oldestHash.equals(getBitcoindService().getBlockHash(oldest)))) {
+                     throw new ChainMismatchException(oldest);
+                 }
+-                int rollbackTo = Math.max(0, markerHeight - MAX_REORG_DEPTH);
++                //never below the index's first block: there is nothing of this index there to remove, and on a pruned node nothing
++                //below it to index again
++                int indexStart = blocksIndex.readStartHeight();
++                int rollbackTo = Math.max(Math.max(0, markerHeight - MAX_REORG_DEPTH), indexStart - 1);
+                 log.info("Stored block hash at height {} does not match bitcoind - rolling back to height {} and re-indexing", markerHeight, rollbackTo);
+                 blocksIndex.removeFromIndex(rollbackTo + 1);
+             }
+@@ -259,7 +272,7 @@ public class BitcoindClient {
+             long pollSeconds = POLL_MEMPOOL_DIFF_INTERVAL_MS / 1000;
+             String fix = zmqUnsupported ? "This Bitcoin Core binary was built without ZMQ support — install a release build, or rebuild with ZeroMQ (-DWITH_ZMQ=ON)"
+                     : autoDiscoveryAttempted ? "Add -zmqpubsequence=tcp://127.0.0.1:28336 to bitcoin.conf" : "Enable -zmqpubsequence in bitcoin.conf and set zmqSequenceEndpoint in config.toml to match";
+-            if(Config.get().getServer().getBackendElectrumServer() != null) {
++            if(Config.get().getServer().getBackendElectrumServerObj() != null) {
+                 log.warn("Polling bitcoind every {}s with backendElectrumServer configured — clients may briefly display incorrect amounts for silent payments transactions. {}", pollSeconds, fix);
+             } else {
+                 log.warn("Polling bitcoind every {}s, for more responsive updates {}", pollSeconds, fix);
+@@ -267,6 +280,32 @@ public class BitcoindClient {
+         }
+     }
+ 
++    /**
++     * Waits while the node is behind the index on the same chain, rather than calling the index another chain's: a node restored from
++     * an older copy, or one that lost its last blocks, can be past initial block download yet below the index. Same chain means the node
++     * knows the index's last block among its headers; a node on another chain (the SHA256 and BLAKE2b chains share every block below
++     * 961640) does not, and the check after this reports it.
++     */
++    private void waitForNodeToReach(int markerHeight, byte[] storedHash, BlockchainInfo blockchainInfo) {
++        if(blockchainInfo.blocks() >= markerHeight) {
++            return;
++        }
++        try {
++            getBitcoindService().getBlockHeader(Sha256Hash.wrap(storedHash).toString());
++        } catch(JsonRpcException e) {
++            return; //not a header the node knows
++        }
++        log.info("The node is at block {}, behind this index (block {}) on the same chain: waiting for it to catch up", blockchainInfo.blocks(), markerHeight);
++        while(!stopped && getBitcoindService().getBlockchainInfo().blocks() < markerHeight) {
++            try {
++                Thread.sleep(10_000);
++            } catch(InterruptedException e) {
++                Thread.currentThread().interrupt();
++                return;
++            }
++        }
++    }
++
+     /**
+      * The tip as wallets receive it from blockchain.headers.subscribe: the node's own serialization of the header, at whatever
+      * length it has (80 bytes, or 164 for a v2 header on the BLAKE2b chain), rather than one rebuilt from getblockheader's JSON
+@@ -906,7 +945,9 @@ public class BitcoindClient {
+      */
+     private Script getScriptPubKey(BitcoindClientService bitcoindClientService, HexFormat hexFormat, HashIndex hashIndex, boolean retry) {
+         Script scriptPubKey = getFromScriptPubKeyCache(hashIndex);
+-        if(scriptPubKey == null && pruned) {
++        //also for the mempool (retry false) on a node that is not pruned: without -txindex, which this server no longer needs,
++        //getrawtransaction finds a confirmed parent only through gettxout
++        if(scriptPubKey == null && (pruned || !retry)) {
+             //without -txindex, which a pruned node cannot have, getrawtransaction finds only mempool transactions. The output a mempool
+             //transaction spends from a confirmed one is still in the UTXO set: include_mempool must be false, because with true an output
+             //already spent in the mempool is reported as spent, and that is exactly the output being looked up
+diff --git a/src/main/java/com/sparrowwallet/frigate/electrum/ElectrumServerService.java b/src/main/java/com/sparrowwallet/frigate/electrum/ElectrumServerService.java
+index b593537..ff1157d 100644
+--- a/src/main/java/com/sparrowwallet/frigate/electrum/ElectrumServerService.java
++++ b/src/main/java/com/sparrowwallet/frigate/electrum/ElectrumServerService.java
+@@ -41,7 +41,8 @@ public class ElectrumServerService {
+     private final RequestHandler requestHandler;
+     private final IndexQuerier indexQuerier;
+     private final ElectrumBackendService electrumBackendService;
+-    private Version protocolVersion;
++    //read by the event bus thread (notifyHeaders) as well as the session's
++    private volatile Version protocolVersion;
+     private volatile BackendSession.VersionRequest backendVersionRequest;
+     private String genesisHash;
+     private java.util.function.BooleanSupplier chainHasV2Headers;
+@@ -229,7 +230,10 @@ public class ElectrumServerService {
+      */
+     private ServerFeatures withChainIdentity(ServerFeatures features) {
+         if(!chainHasV2Headers()) {
+-            return features;
++            //off a v2 chain this server negotiates its own range, which a backend offering more (1.8 on Electrs Pruned and Fulcrum
++            //Pruned) must not widen in what wallets are told; and there is no fork point to report
++            return features.withProtocol(clamp(features.protocol_min(), MIN_VERSION, true), clamp(features.protocol_max(), getMaxSupportedVersion(), false))
++                    .withBlake2bFork(null);
+         }
+         ServerFeatures result = features.withProtocol(PROTOCOL_VERSION_V2.get(), PROTOCOL_VERSION_V2.get());
+         if(result.blake2b_fork() == null && bitcoindClient != null) {
+@@ -241,6 +245,21 @@ public class ElectrumServerService {
+         return result;
+     }
+ 
++    /**
++     * @return the backend's version, raised to bound (atLeast) or lowered to it, or bound itself if the backend's is missing or unreadable
++     */
++    private static String clamp(String backend, Version bound, boolean atLeast) {
++        try {
++            if(backend == null) {
++                return bound.get();
++            }
++            int cmp = new Version(backend).compareTo(bound);
++            return (atLeast ? cmp < 0 : cmp > 0) ? bound.get() : backend;
++        } catch(RuntimeException e) {
++            return bound.get();
++        }
++    }
++
+     static Map<String, ServerFeatures.HostInfo> buildAdvertisedHosts(List<Server> servers) {
+         Map<String, ServerFeatures.HostInfo> result = new LinkedHashMap<>();
+         for(Server server : servers) {
+@@ -362,6 +381,10 @@ public class ElectrumServerService {
+             throw new UnsupportedOperationException("Configure coreServer to use blockchain.headers.subscribe");
+         }
+         ElectrumBlockHeader tip = bitcoindClient.getTip();
++        //the tip read for the answer, checked itself: the chain can cross activation between the check above and this read
++        if(tip != null && tip.isV2() && (protocolVersion == null || protocolVersion.compareTo(PROTOCOL_VERSION_V2) < 0)) {
++            throw new HeaderVersionRefusedException(protocolVersion == null ? "(unnegotiated)" : protocolVersion.get());
++        }
+         requestHandler.runAfterResponse(() -> {
+             requestHandler.subscribeHeaders();
+             ElectrumBlockHeader currentTip = bitcoindClient.getTip();
+diff --git a/src/main/java/com/sparrowwallet/frigate/io/RecentBlocksMap.java b/src/main/java/com/sparrowwallet/frigate/io/RecentBlocksMap.java
+index 8c1a2eb..e65dec2 100644
+--- a/src/main/java/com/sparrowwallet/frigate/io/RecentBlocksMap.java
++++ b/src/main/java/com/sparrowwallet/frigate/io/RecentBlocksMap.java
+@@ -37,6 +37,13 @@ public class RecentBlocksMap {
+         return removedValue;
+     }
+ 
++    public synchronized void clear() {
++        if(!data.isEmpty()) {
++            data.clear();
++            flush();
++        }
++    }
++
+     public synchronized String get(Integer height) {
+         return data.get(height);
+     }
+diff --git a/src/test/java/com/sparrowwallet/frigate/bitcoind/FutureWitnessProgramTest.java b/src/test/java/com/sparrowwallet/frigate/bitcoind/FutureWitnessProgramTest.java
+index d81ef71..f49d104 100644
+--- a/src/test/java/com/sparrowwallet/frigate/bitcoind/FutureWitnessProgramTest.java
++++ b/src/test/java/com/sparrowwallet/frigate/bitcoind/FutureWitnessProgramTest.java
+@@ -1,8 +1,14 @@
+ package com.sparrowwallet.frigate.bitcoind;
+ 
++import com.sparrowwallet.drongo.protocol.*;
++import com.sparrowwallet.drongo.silentpayments.SilentPaymentUtils;
++import com.sparrowwallet.frigate.io.Config;
++import com.sparrowwallet.frigate.io.Server;
++import org.junit.jupiter.api.AfterEach;
+ import org.junit.jupiter.api.Test;
+ 
+ import java.util.HexFormat;
++import java.util.Map;
+ 
+ import static org.junit.jupiter.api.Assertions.*;
+ 
+@@ -31,4 +37,27 @@ public class FutureWitnessProgramTest {
+         assertFalse(future("5220" + "11".repeat(31)), "a push longer than the script");
+         assertFalse(future("6a24aa21a9ed" + "00".repeat(32)), "OP_RETURN");
+     }
++
++    @AfterEach
++    public void tearDown() {
++        Config.setInstance(null);
++    }
++
++    @Test
++    public void aCachedFutureWitnessPrevoutStillSkipsTheTransaction() {
++        Config.setInstance(new Config());
++        BitcoindClient client = new BitcoindClient(null, null, new BitcoindTransport(new Server("http://127.0.0.1:1"), "user:pass"));
++        Sha256Hash parent = Sha256Hash.wrap("11".repeat(32));
++        byte[] v2 = HexFormat.of().parseHex("5220" + "22".repeat(32));
++        byte[] unknown = HexFormat.of().parseHex("6a0401020304");
++        client.addtoScriptPubKeyCache(parent, 0, v2);
++        client.addtoScriptPubKeyCache(parent, 1, unknown);
++
++        HashIndex spent = new HashIndex(parent, 0);
++        Transaction tx = new Transaction();
++        tx.addInput(parent, 0, new Script(new byte[0]));
++        assertTrue(SilentPaymentUtils.spendsInvalidSegwitOutput(tx, Map.of(spent, client.getFromScriptPubKeyCache(spent))),
++                "the v2 program read back from the cache is still seen as one");
++        assertEquals(0, client.getFromScriptPubKeyCache(new HashIndex(parent, 1)).getProgram().length, "other unknown scripts are still cached empty");
++    }
+ }
