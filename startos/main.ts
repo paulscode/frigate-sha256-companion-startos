@@ -128,6 +128,10 @@ export const main = sdk.setupMain(async ({ effects }) => {
   let lastProgress: string | null = null
   let fatal: string | null = null
   let backendCheck: 'unknown' | 'same' | 'different' = 'unknown'
+  // Look Back for Payments (the backfill), which runs once the index has caught up with the tip
+  let backfillTarget: string | null = null
+  let backfillProgress: string | null = null
+  let backfillWaiting: string | null = null
   let backendDetail: string | null = null
 
   const onLine = (line: string) => {
@@ -139,6 +143,31 @@ export const main = sdk.setupMain(async ({ effects }) => {
     if (progress) {
       indexing = true
       lastProgress = progress[1].trim()
+    }
+    const bfStart =
+      /Backfill: (?:looking back to block|resuming at block \d+, looking back to block) (\d+)/.exec(
+        line,
+      )
+    if (bfStart) {
+      backfillTarget = bfStart[1]
+      backfillProgress = null
+      backfillWaiting = null
+    }
+    const bfProgress = /Backfill progress: (.+)/.exec(line)
+    if (bfProgress) {
+      backfillProgress = bfProgress[1].trim()
+      backfillWaiting = null
+    }
+    const bfWaiting = /Backfill waiting: (.+)/.exec(line)
+    if (bfWaiting) backfillWaiting = bfWaiting[1].trim().slice(0, 300)
+    if (
+      /Backfill complete|Backfill stopping|Backfill stopped by an error/.test(
+        line,
+      )
+    ) {
+      backfillTarget = null
+      backfillProgress = null
+      backfillWaiting = null
     }
     const f = /FATAL: (.+)/.exec(line)
     if (f) fatal = f[1].trim().slice(0, 400)
@@ -183,6 +212,9 @@ export const main = sdk.setupMain(async ({ effects }) => {
           indexing = false
           lastProgress = null
           fatal = null
+          backfillTarget = null
+          backfillProgress = null
+          backfillWaiting = null
           return {
             command: [
               'sh',
@@ -242,14 +274,32 @@ exit "$rc"`,
         fn: async () => {
           const start = await indexStart()
           if ((await listening()).result === 'success') {
+            const synced = start
+              ? i18n(
+                  'Fully synced. Silent Payments are indexed from block ${start}.',
+                  { start },
+                )
+              : i18n('Fully synced')
+            // Wallets are served throughout a backfill, so it reports as success
+            const lookingBack =
+              backfillTarget === null
+                ? null
+                : backfillWaiting
+                  ? i18n(
+                      'Looking back to block ${target} is waiting: ${reason}',
+                      { target: backfillTarget, reason: backfillWaiting },
+                    )
+                  : backfillProgress
+                    ? i18n('Looking back to block ${target}: ${progress}', {
+                        target: backfillTarget,
+                        progress: backfillProgress,
+                      })
+                    : i18n('Looking back to block ${target}', {
+                        target: backfillTarget,
+                      })
             return {
               result: 'success',
-              message: start
-                ? i18n(
-                    'Fully synced. Silent Payments are indexed from block ${start}.',
-                    { start },
-                  )
-                : i18n('Fully synced'),
+              message: lookingBack ? `${synced} ${lookingBack}` : synced,
             }
           }
           if (fatal) return { result: 'failure', message: fatal }

@@ -1,0 +1,1617 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Paul Lamb <paul@paulscode.com>
+Date: Mon, 9 Nov 2026 08:18:03 -0600
+Subject: [PATCH 8/8] Backfill: index blocks below where a pruned node's index
+ starts
+
+Opt-in (index.backfillFromHeight, index.backfillSpeed): from the chosen block up
+to the index's first block, oldest first, after the index has caught up with the
+tip. Blocks come from the node, its btc-rpc-proxy, or getblockfrompeer, checked
+against the node's header (hash, Merkle root, witness commitment); prevouts come
+from the scriptPubKey cache or the Electrum backend, each transaction checked
+against its txid. One transaction per block with the position, so a stop resumes
+where it left off; connected wallets are scanned over each backfilled range.
+---
+ .../com/sparrowwallet/frigate/Frigate.java    |  10 +-
+ .../frigate/bitcoind/Backfill.java            | 694 ++++++++++++++++++
+ .../frigate/bitcoind/BitcoindClient.java      |  52 +-
+ .../bitcoind/BitcoindClientService.java       |   6 +
+ .../frigate/bitcoind/PeerInfo.java            |  16 +
+ .../frigate/electrum/RequestHandler.java      |  12 +
+ .../sparrowwallet/frigate/index/Index.java    | 197 ++++-
+ .../index/SilentPaymentsBackfillUpdate.java   |   8 +
+ .../com/sparrowwallet/frigate/io/Config.java  |  33 +
+ .../frigate/bitcoind/BackfillJobTest.java     | 117 +++
+ .../frigate/bitcoind/BackfillVerifyTest.java  | 103 +++
+ .../frigate/index/IndexBackfillTest.java      | 118 +++
+ .../frigate/index/IndexResumeTest.java        |   1 +
+ .../frigate/bitcoind/block-980821.hex         |   1 +
+ 14 files changed, 1339 insertions(+), 29 deletions(-)
+ create mode 100644 src/main/java/com/sparrowwallet/frigate/bitcoind/Backfill.java
+ create mode 100644 src/main/java/com/sparrowwallet/frigate/bitcoind/PeerInfo.java
+ create mode 100644 src/main/java/com/sparrowwallet/frigate/index/SilentPaymentsBackfillUpdate.java
+ create mode 100644 src/test/java/com/sparrowwallet/frigate/bitcoind/BackfillJobTest.java
+ create mode 100644 src/test/java/com/sparrowwallet/frigate/bitcoind/BackfillVerifyTest.java
+ create mode 100644 src/test/java/com/sparrowwallet/frigate/index/IndexBackfillTest.java
+ create mode 100644 src/test/resources/com/sparrowwallet/frigate/bitcoind/block-980821.hex
+
+diff --git a/src/main/java/com/sparrowwallet/frigate/Frigate.java b/src/main/java/com/sparrowwallet/frigate/Frigate.java
+index 7c81b70..f0f1374 100644
+--- a/src/main/java/com/sparrowwallet/frigate/Frigate.java
++++ b/src/main/java/com/sparrowwallet/frigate/Frigate.java
+@@ -50,6 +50,8 @@ public class Frigate {
+ 
+     private static Object trayManager;
+ 
++    private volatile com.sparrowwallet.frigate.bitcoind.Backfill backfill;
++
+     public void start() {
+         getLogger().info("Starting " + SERVER_NAME + " v" + SERVER_VERSION + " on " + Network.get().getName());
+         getLogger().info("Using home directory " + Storage.getFrigateHome().getAbsolutePath());
+@@ -88,6 +90,8 @@ public class Frigate {
+         InetSocketAddress sslBind = toBindAddress(serverConfig.getSslServer());
+         if(bitcoindClient != null) {
+             com.sparrowwallet.frigate.electrum.BackendChainCheck.start(bitcoindClient, serverConfig.getBackendElectrumServerObj());
++            backfill = com.sparrowwallet.frigate.bitcoind.Backfill.start(bitcoindClient, blocksIndex,
++                    Network.get() == Network.MAINNET ? MAINNET_TAPROOT_ACTIVATION_HEIGHT : TESTNET_TAPROOT_ACTIVATION_HEIGHT);
+         }
+         indexQuerier = new IndexQuerier(blocksIndex, mempoolIndex);
+         electrumServer = new ElectrumServerRunnable(bitcoindClient, indexQuerier, tcpBind, sslBind, sslContext);
+@@ -105,7 +109,11 @@ public class Frigate {
+     public void stop() {
+         getLogger().info(SERVER_NAME + " shutting down...");
+ 
+-        //the Electrum server first, so no session is still using the indexes or bitcoind as they close
++        //a backfill first: it stops between blocks or lookups, within a second or two, and writes to the index
++        if(backfill != null) {
++            backfill.stop();
++        }
++        //the Electrum server next, so no session is still using the indexes or bitcoind as they close
+         if(electrumServer != null) {
+             electrumServer.shutdown(Duration.ofSeconds(Config.get().getServer().getShutdownDrainSeconds()));
+         }
+diff --git a/src/main/java/com/sparrowwallet/frigate/bitcoind/Backfill.java b/src/main/java/com/sparrowwallet/frigate/bitcoind/Backfill.java
+new file mode 100644
+index 0000000..0def7f0
+--- /dev/null
++++ b/src/main/java/com/sparrowwallet/frigate/bitcoind/Backfill.java
+@@ -0,0 +1,694 @@
++package com.sparrowwallet.frigate.bitcoind;
++
++import com.github.arteam.simplejsonrpc.client.JsonRpcClient;
++import com.github.arteam.simplejsonrpc.client.exception.JsonRpcException;
++import com.sparrowwallet.drongo.Utils;
++import com.sparrowwallet.drongo.protocol.*;
++import com.sparrowwallet.drongo.silentpayments.SilentPaymentUtils;
++import com.sparrowwallet.drongo.wallet.BlockTransaction;
++import com.sparrowwallet.frigate.Frigate;
++import com.sparrowwallet.frigate.electrum.BackendChainCheck;
++import com.sparrowwallet.frigate.electrum.ElectrumBackendService;
++import com.sparrowwallet.frigate.electrum.ElectrumServerService;
++import com.sparrowwallet.frigate.electrum.ElectrumTransport;
++import com.sparrowwallet.frigate.index.Index;
++import com.sparrowwallet.frigate.index.SilentPaymentsBackfillUpdate;
++import com.sparrowwallet.frigate.io.BackendTls;
++import com.sparrowwallet.frigate.io.Config;
++import com.sparrowwallet.frigate.io.Server;
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++
++import java.util.*;
++import java.util.concurrent.*;
++import java.util.function.Supplier;
++
++/**
++ * Adds blocks below where the index starts, back to a chosen block, for a pruned node that no longer holds them. Opt-in
++ * (index.backfillFromHeight), one block at a time, oldest first, in its own thread once the index has caught up with the tip.
++ *
++ * For each block:
++ * <ol>
++ * <li>the block itself: getblock verbosity 3 if the node still has it with its undo data (an archival node: prevouts included, nothing
++ * more to fetch). Otherwise getblock verbosity 0, which a pruned node's btc-rpc-proxy answers by fetching the block from peers without
++ * storing it; and if the node itself answers (no proxy), getblockfrompeer, then getblock once it has arrived;</li>
++ * <li>checked against the node's own header for that height: hash, Merkle root, and witness commitment, since peers are not trusted
++ * and the input keys come from witness data;</li>
++ * <li>the prevouts of its eligible transactions from the scriptPubKey cache, else from the Electrum backend
++ * (blockchain.transaction.get on the parent), several in flight on a pool of connections, each returned transaction checked against
++ * the txid asked for;</li>
++ * <li>the tweaks written in one transaction with the advanced position, so a stop or crash resumes where it left off.</li>
++ * </ol>
++ * A failure never skips a block: the backfill waits and retries, with a growing delay. Oldest first matters: outputs created inside
++ * the range are in the cache by the time later blocks in it spend them, which is most of the saving the measurements assume.
++ */
++public class Backfill {
++    private static final Logger log = LoggerFactory.getLogger(Backfill.class);
++
++    static final long RETRY_INITIAL_MILLIS = 5_000;
++    static final long RETRY_MAX_MILLIS = 600_000;
++    static final long PEER_WAIT_MILLIS = 30_000;
++    static final long NOTIFY_INTERVAL_MILLIS = 60_000;
++    static final long PROGRESS_LOG_MILLIS = 30_000;
++    static final long CHAIN_CHECK_WAIT_MILLIS = 60_000;
++    static final long BACKEND_REQUEST_TIMEOUT_MILLIS = 180_000;
++    static final long STOP_JOIN_MILLIS = 10_000;
++
++    private static final byte[] WITNESS_COMMITMENT_PREFIX = {0x6a, 0x24, (byte)0xaa, 0x21, (byte)0xa9, (byte)0xed};
++
++    private final BitcoindClient bitcoindClient;
++    private final Index index;
++    private final int minHeight;
++    private final Server backend;
++    private final BackendTls backendTls;
++    private final int inFlight;
++    private final HexFormat hexFormat = HexFormat.of();
++
++    private final Object waitLock = new Object();
++    private volatile boolean stopped;
++    private Thread thread;
++    private ExecutorService lookupPool;
++    private final BlockingQueue<BackendConnection> connections = new LinkedBlockingQueue<>();
++    private final List<BackendConnection> allConnections = new CopyOnWriteArrayList<>();
++
++    Backfill(BitcoindClient bitcoindClient, Index index, int minHeight, Server backend, BackendTls backendTls, int inFlight) {
++        this.bitcoindClient = bitcoindClient;
++        this.index = index;
++        this.minHeight = minHeight;
++        this.backend = backend;
++        this.backendTls = backendTls;
++        this.inFlight = Math.max(1, inFlight);
++    }
++
++    /**
++     * Starts a backfill if one is configured, or if one is recorded (so that turning it off is reported).
++     *
++     * @param minHeight the lowest block worth indexing: Taproot activation on mainnet, as no earlier block can hold a Silent Payment
++     * @return the running backfill, to stop on shutdown, or null if there is nothing to do
++     */
++    public static Backfill start(BitcoindClient bitcoindClient, Index index, int minHeight) {
++        Config.IndexConfig indexConfig = Config.get().getIndex();
++        Config.ServerConfig serverConfig = Config.get().getServer();
++        Server backend = serverConfig.getBackendElectrumServerObj();
++        Backfill backfill = new Backfill(bitcoindClient, index, minHeight, backend, backend == null ? null : BackendTls.fromConfig(serverConfig),
++                indexConfig.getBackfillInFlight());
++        Index.BackfillJob job = backfill.resolveJob(indexConfig.getBackfillFromHeight());
++        if(job == null) {
++            return null;
++        }
++        backfill.startThread(job);
++        return backfill;
++    }
++
++    private void startThread(Index.BackfillJob job) {
++        lookupPool = Executors.newFixedThreadPool(inFlight, runnable -> {
++            Thread t = new Thread(runnable, "BackfillLookup");
++            t.setDaemon(true);
++            return t;
++        });
++        for(int i = 0; i < inFlight; i++) {
++            BackendConnection connection = new BackendConnection();
++            allConnections.add(connection);
++            connections.add(connection);
++        }
++        thread = new Thread(() -> {
++            try {
++                runJob(job);
++            } catch(Throwable t) {
++                if(!stopped) {
++                    log.error("Backfill stopped by an error; it resumes at block " + safeNext() + " when Frigate next starts", t);
++                }
++            } finally {
++                closeConnections();
++                lookupPool.shutdownNow();
++            }
++        }, "Backfill");
++        thread.setDaemon(true);
++        thread.start();
++    }
++
++    private String safeNext() {
++        try {
++            Index.BackfillJob job = index.getBackfillJob();
++            return job == null ? "?" : Integer.toString(job.next());
++        } catch(RuntimeException e) {
++            return "?";
++        }
++    }
++
++    /**
++     * Works out what to do from the configured block and the recorded state: finishes a backfill that completed just before a stop,
++     * resumes one for the same block, or starts a new one. A backfill for another block is replaced; the blocks it added stay in the
++     * index (they are correct, and a later backfill over them replaces them rather than adding them twice).
++     *
++     * @return the backfill to run, or null if there is none
++     */
++    Index.BackfillJob resolveJob(Integer requested) {
++        Index.BackfillJob job = index.getBackfillJob();
++        int start = index.readStartHeight();
++
++        if(job != null && job.isComplete()) {
++            finish(job);
++            start = job.target();
++            job = null;
++        }
++
++        if(requested == null) {
++            if(job != null) {
++                log.info("Backfill is off: the {} blocks it added from block {} are kept, and it resumes at block {} if it is turned back on for block {}",
++                        job.next() - job.target(), job.target(), job.next(), job.target());
++            }
++            return null;
++        }
++
++        int target = Math.max(requested, minHeight);
++        if(start < 0) {
++            log.warn("Backfill waiting: the block this index starts at is not recorded, so there is no range to fill below it. Rebuild the index to record it.");
++            return null;
++        }
++        if(target >= start) {
++            if(job != null) {
++                index.clearBackfillJob();
++            }
++            log.info("Backfill: nothing to do, the index already starts at block {}, at or below block {}", start, target);
++            return null;
++        }
++        if(backend == null && bitcoindClient.isPruned()) {
++            log.warn("Backfill waiting: on a pruned node it looks up the coins old transactions spend through the Electrum backend, and none is configured");
++            return null;
++        }
++
++        if(job != null && job.target() == target && job.end() == start) {
++            log.info("Backfill: resuming at block {}, looking back to block {} ({} of {} blocks left)", job.next(), target, job.end() - job.next(), job.end() - target);
++            return job;
++        }
++
++        job = new Index.BackfillJob(target, target, start);
++        index.setBackfillJob(job);
++        log.info("Backfill: looking back to block {}: {} blocks, {} to {}, below where the index starts", target, start - target, target, start - 1);
++        return job;
++    }
++
++    private void finish(Index.BackfillJob job) {
++        index.writeStartHeight(job.target());
++        index.clearBackfillJob();
++        log.info("Backfill complete: the index now starts at block {}", job.target());
++    }
++
++    void runJob(Index.BackfillJob job) {
++        int total = job.end() - job.target();
++        long startedMillis = System.currentTimeMillis();
++        int startedNext = job.next();
++        long lastLogMillis = startedMillis;
++        long lastNotifyMillis = startedMillis;
++        int notifyFrom = job.next();
++
++        while(!job.isComplete()) {
++            if(stopped) {
++                log.info("Backfill stopping at block {}; it resumes there when Frigate next starts", job.next());
++                notifyWallets(notifyFrom, job.next() - 1);
++                return;
++            }
++            waitWhileBackendOnAnotherChain();
++
++            int height = job.next();
++            Map<BlockTransaction, byte[]> tweaks = retrying("block " + height, () -> getBlockTweaks(height));
++            if(tweaks == null) {
++                continue;
++            }
++            Index.BackfillJob current = job;
++            if(retrying("writing block " + height, () -> { index.addBackfillBlock(height, tweaks, current); return true; }) == null) {
++                continue;
++            }
++            job = new Index.BackfillJob(job.target(), height + 1, job.end());
++
++            long now = System.currentTimeMillis();
++            if(now - lastLogMillis >= PROGRESS_LOG_MILLIS || job.isComplete()) {
++                int done = job.next() - job.target();
++                double rate = (job.next() - startedNext) / Math.max(1.0, (now - startedMillis) / 1000.0);
++                String left = rate > 0 ? ", about " + formatDuration((long)((job.end() - job.next()) / rate)) + " left" : "";
++                log.info("Backfill progress: {} / {} blocks ({}%, height {}){}", done, total, String.format(Locale.ROOT, "%.1f", 100.0 * done / total), height, left);
++                lastLogMillis = now;
++            }
++            if(now - lastNotifyMillis >= NOTIFY_INTERVAL_MILLIS) {
++                notifyWallets(notifyFrom, height);
++                notifyFrom = height + 1;
++                lastNotifyMillis = now;
++            }
++        }
++
++        notifyWallets(notifyFrom, job.end() - 1);
++        finish(job);
++    }
++
++    private void notifyWallets(int from, int to) {
++        if(from <= to) {
++            Frigate.getEventBus().post(new SilentPaymentsBackfillUpdate(from, to));
++        }
++    }
++
++    static String formatDuration(long seconds) {
++        if(seconds < 3600) {
++            return Math.max(1, seconds / 60) + "m";
++        }
++        if(seconds < 86400 * 2) {
++            return (seconds / 3600) + "h " + ((seconds % 3600) / 60) + "m";
++        }
++        return (seconds / 86400) + "d " + ((seconds % 86400) / 3600) + "h";
++    }
++
++    private void waitWhileBackendOnAnotherChain() {
++        boolean logged = false;
++        while(!stopped && backend != null && BackendChainCheck.getState() == BackendChainCheck.State.DIFFERENT) {
++            if(!logged) {
++                log.warn("Backfill waiting: the Electrum backend follows a different chain from the node");
++                logged = true;
++            }
++            sleep(CHAIN_CHECK_WAIT_MILLIS);
++        }
++    }
++
++    /**
++     * Runs a step until it succeeds or the backfill stops, waiting longer after each failure.
++     *
++     * @return the step's result, or null if the backfill stopped first
++     */
++    private <T> T retrying(String what, Supplier<T> step) {
++        long delay = RETRY_INITIAL_MILLIS;
++        while(!stopped) {
++            try {
++                return step.get();
++            } catch(RuntimeException e) {
++                if(stopped) {
++                    return null;
++                }
++                log.warn("Backfill waiting: {} failed ({}), retrying in {}s", what, describe(e), delay / 1000);
++                log.debug("Backfill failure", e);
++                sleep(delay);
++                delay = Math.min(delay * 2, RETRY_MAX_MILLIS);
++            }
++        }
++        return null;
++    }
++
++    private static String describe(Throwable e) {
++        Throwable t = e;
++        while(t.getCause() != null && t.getMessage() == null) {
++            t = t.getCause();
++        }
++        if(t instanceof JsonRpcException jre && jre.getErrorMessage() != null) {
++            return jre.getErrorMessage().getMessage();
++        }
++        return t.getMessage() != null ? t.getMessage() : t.getClass().getSimpleName();
++    }
++
++    /**
++     * @return the tweaks of the block at this height on the node's chain, or null if the backfill stopped first
++     */
++    Map<BlockTransaction, byte[]> getBlockTweaks(int height) {
++        BitcoindClientService service = bitcoindClient.getBitcoindService();
++        String blockHash = service.getBlockHash(height);
++
++        try {
++            VerboseBlock verboseBlock = service.getVerboseBlock(blockHash, 3);
++            Map<BlockTransaction, byte[]> tweaks = bitcoindClient.getVerboseBlockTweaks(height, verboseBlock, hexFormat);
++            if(tweaks != null) {
++                return tweaks;
++            }
++        } catch(JsonRpcException e) {
++            //pruned, or kept without undo data: fetch it
++            log.debug("Block {} is not on the node with its undo data ({}), fetching it", height, describe(e));
++        }
++
++        Block block = fetchBlock(service, blockHash);
++        if(block == null) {
++            return null;
++        }
++        verifyBlock(block, blockHash);
++        return getTweaks(height, block);
++    }
++
++    private Block fetchBlock(BitcoindClientService service, String blockHash) {
++        try {
++            return parseBlock((String)service.getBlock(blockHash, 0));
++        } catch(JsonRpcException e) {
++            if(!BitcoindClient.isPrunedBlockError(e)) {
++                throw e;
++            }
++        }
++        return fetchBlockFromPeer(service, blockHash);
++    }
++
++    private Block parseBlock(String hex) {
++        return new Block(hexFormat.parseHex(hex));
++    }
++
++    /**
++     * Asks the node to fetch a pruned block from a peer that serves old blocks, and reads it once it arrives. The node keeps the block
++     * until it next prunes, as it would a new one; it adds no undo data.
++     */
++    private Block fetchBlockFromPeer(BitcoindClientService service, String blockHash) {
++        List<PeerInfo> peers = new ArrayList<>(service.getPeerInfo().stream().filter(PeerInfo::servesHistoricalBlocks).toList());
++        if(peers.isEmpty()) {
++            throw new IllegalStateException("the node has no peer that serves old blocks, to fetch pruned block " + blockHash + " from");
++        }
++        Collections.shuffle(peers);
++        for(PeerInfo peer : peers) {
++            if(stopped) {
++                return null;
++            }
++            try {
++                service.getBlockFromPeer(blockHash, peer.id());
++            } catch(JsonRpcException e) {
++                log.debug("Peer {} was not asked for block {}: {}", peer.id(), blockHash, describe(e));
++                //"Block already downloaded" means it is there to read; anything else, try the next peer
++                if(describe(e) == null || !describe(e).contains("already")) {
++                    continue;
++                }
++            }
++            long deadline = System.currentTimeMillis() + PEER_WAIT_MILLIS;
++            while(!stopped && System.currentTimeMillis() < deadline) {
++                try {
++                    return parseBlock((String)service.getBlock(blockHash, 0));
++                } catch(JsonRpcException e) {
++                    sleep(1000);
++                }
++            }
++        }
++        throw new IllegalStateException("no peer sent pruned block " + blockHash);
++    }
++
++    /**
++     * Checks a block fetched from peers against the node's header: the header must hash to the block asked for, and the transactions
++     * must be the ones it commits to, txids through the Merkle root and witness data through the coinbase's witness commitment (BIP141).
++     */
++    static void verifyBlock(Block block, String blockHash) {
++        if(!block.getHash().toString().equals(blockHash)) {
++            throw new IllegalStateException("fetched block hashes to " + block.getHash() + ", not " + blockHash);
++        }
++        List<Transaction> txs = block.getTransactions();
++        if(txs.isEmpty() || !txs.getFirst().isCoinBase()) {
++            throw new IllegalStateException("fetched block " + blockHash + " has no coinbase");
++        }
++
++        List<byte[]> txids = new ArrayList<>(txs.size());
++        Set<Sha256Hash> seen = new HashSet<>();
++        for(Transaction tx : txs) {
++            //a repeated transaction can leave the Merkle root unchanged (CVE-2012-2459), so a block with one is a mutated copy
++            if(!seen.add(tx.getTxId())) {
++                throw new IllegalStateException("fetched block " + blockHash + " repeats transaction " + tx.getTxId());
++            }
++            txids.add(tx.getTxId().getReversedBytes());
++        }
++        if(!Arrays.equals(merkleRoot(txids), block.getBlockHeader().getMerkleRoot().getReversedBytes())) {
++            throw new IllegalStateException("fetched block " + blockHash + " does not match its header's Merkle root");
++        }
++
++        Transaction coinbase = txs.getFirst();
++        byte[] commitment = null;
++        for(TransactionOutput output : coinbase.getOutputs()) {
++            byte[] script = output.getScriptBytes();
++            if(script.length >= 38 && Arrays.equals(Arrays.copyOf(script, WITNESS_COMMITMENT_PREFIX.length), WITNESS_COMMITMENT_PREFIX)) {
++                commitment = Arrays.copyOfRange(script, 6, 38);
++            }
++        }
++        if(commitment == null) {
++            for(Transaction tx : txs) {
++                if(tx.hasWitnesses()) {
++                    throw new IllegalStateException("fetched block " + blockHash + " has witness data but no witness commitment");
++                }
++            }
++            return;
++        }
++
++        TransactionInput coinbaseInput = coinbase.getInputs().getFirst();
++        List<byte[]> reserved = coinbaseInput.hasWitness() ? coinbaseInput.getWitness().getPushes() : List.of();
++        if(reserved.size() != 1 || reserved.getFirst().length != 32) {
++            throw new IllegalStateException("fetched block " + blockHash + " has a witness commitment without a 32 byte reserved value");
++        }
++        List<byte[]> wtxids = new ArrayList<>(txs.size());
++        wtxids.add(new byte[32]);
++        for(int i = 1; i < txs.size(); i++) {
++            wtxids.add(txs.get(i).getWTxId().getReversedBytes());
++        }
++        byte[] expected = Sha256Hash.twiceOf(Utils.concat(merkleRoot(wtxids), reserved.getFirst())).getBytes();
++        if(!Arrays.equals(expected, commitment)) {
++            throw new IllegalStateException("fetched block " + blockHash + " does not match its witness commitment");
++        }
++    }
++
++    /**
++     * @param leaves hashes in internal (serialized) byte order
++     * @return the Merkle root, in internal byte order
++     */
++    static byte[] merkleRoot(List<byte[]> leaves) {
++        List<byte[]> level = new ArrayList<>(leaves);
++        while(level.size() > 1) {
++            List<byte[]> next = new ArrayList<>((level.size() + 1) / 2);
++            for(int i = 0; i < level.size(); i += 2) {
++                byte[] left = level.get(i);
++                byte[] right = i + 1 < level.size() ? level.get(i + 1) : left;
++                next.add(Sha256Hash.twiceOf(left, right).getBytes());
++            }
++            level = next;
++        }
++        return level.getFirst();
++    }
++
++    /**
++     * The tweaks of a block whose prevouts the node cannot supply: from the block's own outputs and the cache, and the rest from the
++     * Electrum backend.
++     */
++    Map<BlockTransaction, byte[]> getTweaks(int height, Block block) {
++        Map<HashIndex, Script> known = new HashMap<>();
++        List<Transaction> eligible = new ArrayList<>();
++        for(Transaction tx : block.getTransactions()) {
++            List<TransactionOutput> outputs = tx.getOutputs();
++            for(int i = 0; i < outputs.size(); i++) {
++                byte[] script = outputs.get(i).getScriptBytes();
++                known.put(new HashIndex(tx.getTxId(), i), new Script(script));
++                bitcoindClient.addtoScriptPubKeyCache(tx.getTxId(), i, script);
++            }
++            if(!tx.isCoinBase() && BitcoindClient.containsTaprootOutput(tx)) {
++                eligible.add(tx);
++            }
++        }
++
++        Set<Sha256Hash> missing = new LinkedHashSet<>();
++        for(Transaction tx : eligible) {
++            for(TransactionInput input : tx.getInputs()) {
++                HashIndex hashIndex = new HashIndex(input.getOutpoint().getHash(), input.getOutpoint().getIndex());
++                if(known.containsKey(hashIndex)) {
++                    continue;
++                }
++                Script cached = bitcoindClient.getFromScriptPubKeyCache(hashIndex);
++                if(cached != null) {
++                    known.put(hashIndex, cached);
++                } else {
++                    missing.add(hashIndex.getHash());
++                }
++            }
++        }
++
++        Map<Sha256Hash, Transaction> parents = lookUpTransactions(missing);
++        if(parents == null) {
++            return null;
++        }
++        log.debug("Backfill block {}: {} eligible, {} prevout transactions from the backend", height, eligible.size(), parents.size());
++        for(Transaction parent : parents.values()) {
++            List<TransactionOutput> outputs = parent.getOutputs();
++            for(int i = 0; i < outputs.size(); i++) {
++                byte[] script = outputs.get(i).getScriptBytes();
++                known.put(new HashIndex(parent.getTxId(), i), new Script(script));
++                bitcoindClient.addtoScriptPubKeyCache(parent.getTxId(), i, script);
++            }
++        }
++
++        Map<BlockTransaction, byte[]> tweaks = new LinkedHashMap<>();
++        for(Transaction tx : eligible) {
++            Map<HashIndex, Script> spent = new HashMap<>();
++            for(TransactionInput input : tx.getInputs()) {
++                HashIndex hashIndex = new HashIndex(input.getOutpoint().getHash(), input.getOutpoint().getIndex());
++                Script script = known.get(hashIndex);
++                if(script == null) {
++                    throw new IllegalStateException("no output " + hashIndex.getIndex() + " in transaction " + hashIndex.getHash() + ", spent in block " + height);
++                }
++                spent.put(hashIndex, script);
++            }
++            byte[] tweak = SilentPaymentUtils.getTweak(tx, spent, false);
++            if(tweak != null) {
++                BlockTransaction blkTx = new BlockTransaction(tx.getTxId(), height, block.getBlockHeader().getTimeAsDate(), 0L, tx, block.getHash());
++                tweaks.put(blkTx, SilentPaymentUtils.getSecp256k1PubKey(tweak));
++            }
++        }
++        return tweaks;
++    }
++
++    /**
++     * Fetches transactions from the Electrum backend, several at a time.
++     *
++     * @return the transactions by txid, or null if the backfill stopped first
++     */
++    private Map<Sha256Hash, Transaction> lookUpTransactions(Set<Sha256Hash> txids) {
++        if(txids.isEmpty()) {
++            return Map.of();
++        }
++        if(backend == null) {
++            throw new IllegalStateException("no Electrum backend is configured to look up the coins block transactions spend");
++        }
++        Map<Sha256Hash, Future<Transaction>> futures = new LinkedHashMap<>();
++        for(Sha256Hash txid : txids) {
++            futures.put(txid, lookupPool.submit(() -> lookUpTransaction(txid)));
++        }
++        Map<Sha256Hash, Transaction> found = new HashMap<>();
++        try {
++            for(Map.Entry<Sha256Hash, Future<Transaction>> entry : futures.entrySet()) {
++                while(true) {
++                    if(stopped) {
++                        return null;
++                    }
++                    try {
++                        Transaction tx = entry.getValue().get(1, TimeUnit.SECONDS);
++                        if(tx == null) {
++                            return null;
++                        }
++                        found.put(entry.getKey(), tx);
++                        break;
++                    } catch(TimeoutException e) {
++                        //check for a stop, then wait on
++                    } catch(InterruptedException e) {
++                        Thread.currentThread().interrupt();
++                        return null;
++                    } catch(ExecutionException e) {
++                        throw new IllegalStateException(e.getCause());
++                    }
++                }
++            }
++            return found;
++        } finally {
++            futures.values().forEach(future -> future.cancel(true));
++        }
++    }
++
++    /**
++     * @return the transaction, checked against its txid, or null if the backfill stopped first
++     */
++    private Transaction lookUpTransaction(Sha256Hash txid) throws InterruptedException {
++        long delay = RETRY_INITIAL_MILLIS;
++        for(int attempt = 1; !stopped; attempt++) {
++            BackendConnection connection = connections.poll(1, TimeUnit.SECONDS);
++            if(connection == null) {
++                continue;
++            }
++            try {
++                Object answer = connection.service().getTransaction(txid.toString(), false);
++                if(!(answer instanceof String hex)) {
++                    throw new IllegalStateException("the backend answered with something other than a transaction");
++                }
++                Transaction tx = new Transaction(hexFormat.parseHex(hex));
++                if(!tx.getTxId().equals(txid)) {
++                    throw new IllegalStateException("the backend returned a transaction that hashes to " + tx.getTxId());
++                }
++                return tx;
++            } catch(Exception e) {
++                if(stopped) {
++                    return null;
++                }
++                connection.close();
++                if(attempt == 1 || delay >= RETRY_MAX_MILLIS) {
++                    log.warn("Backfill waiting: looking up transaction {} on the Electrum backend failed ({}), retrying in {}s", txid, describe(e), delay / 1000);
++                } else {
++                    log.debug("Backfill lookup of {} failed again ({})", txid, describe(e));
++                }
++            } finally {
++                connections.add(connection);
++            }
++            sleep(delay);
++            delay = Math.min(delay * 2, RETRY_MAX_MILLIS);
++        }
++        return null;
++    }
++
++    private void sleep(long millis) {
++        synchronized(waitLock) {
++            if(stopped) {
++                return;
++            }
++            try {
++                waitLock.wait(millis);
++            } catch(InterruptedException e) {
++                Thread.currentThread().interrupt();
++            }
++        }
++    }
++
++    public void stop() {
++        stopped = true;
++        synchronized(waitLock) {
++            waitLock.notifyAll();
++        }
++        closeConnections();
++        if(lookupPool != null) {
++            lookupPool.shutdownNow();
++        }
++        if(thread != null) {
++            try {
++                thread.join(STOP_JOIN_MILLIS);
++            } catch(InterruptedException e) {
++                Thread.currentThread().interrupt();
++            }
++        }
++    }
++
++    private void closeConnections() {
++        allConnections.forEach(BackendConnection::close);
++    }
++
++    /**
++     * One connection to the Electrum backend, opened when first used and again after a failure. Requests on a connection are serial,
++     * so the pool holds one per lookup in flight.
++     */
++    private class BackendConnection {
++        //used by one lookup at a time (it is taken from the pool), and closed from another thread only on a stop, which must not wait
++        //for a connect in progress
++        private volatile ElectrumTransport transport;
++        private volatile Thread reader;
++        private volatile ElectrumBackendService service;
++
++        ElectrumBackendService service() throws Exception {
++            ElectrumBackendService current = service;
++            if(current != null) {
++                return current;
++            }
++            if(stopped) {
++                throw new IllegalStateException("stopped");
++            }
++            ElectrumTransport newTransport = new ElectrumTransport(backend.getHostAndPort(), backend.getProtocol(), new Object(), BACKEND_REQUEST_TIMEOUT_MILLIS, backendTls);
++            transport = newTransport;
++            newTransport.connect();
++            reader = Thread.ofVirtual().name("BackfillBackendReader").start(newTransport::readInputLoop);
++            ElectrumBackendService newService = new JsonRpcClient(newTransport).onDemand(ElectrumBackendService.class);
++            newService.getServerVersion("Frigate backfill", List.of(ElectrumServerService.MIN_VERSION.get(), ElectrumServerService.PROTOCOL_VERSION_V2.get()));
++            service = newService;
++            return newService;
++        }
++
++        void close() {
++            ElectrumTransport closing = transport;
++            Thread closingReader = reader;
++            transport = null;
++            reader = null;
++            service = null;
++            if(closing != null) {
++                try {
++                    closing.close();
++                } catch(Exception e) {
++                    log.debug("Error closing a backfill backend connection", e);
++                }
++            }
++            if(closingReader != null) {
++                closingReader.interrupt();
++            }
++        }
++    }
++}
+diff --git a/src/main/java/com/sparrowwallet/frigate/bitcoind/BitcoindClient.java b/src/main/java/com/sparrowwallet/frigate/bitcoind/BitcoindClient.java
+index b4a3345..7f308ae 100644
+--- a/src/main/java/com/sparrowwallet/frigate/bitcoind/BitcoindClient.java
++++ b/src/main/java/com/sparrowwallet/frigate/bitcoind/BitcoindClient.java
+@@ -318,7 +318,7 @@ public class BitcoindClient {
+      * A getblock for a block the node has pruned. Core and Knots answer "Block not available (pruned data)"; btc-rpc-proxy passes
+      * verbosity 3 straight to the node, since peers cannot supply undo data, so the answer is the node's.
+      */
+-    private static boolean isPrunedBlockError(Throwable e) {
++    static boolean isPrunedBlockError(Throwable e) {
+         for(Throwable t = e; t != null; t = t.getCause()) {
+             if(t instanceof JsonRpcException jre && jre.getErrorMessage() != null && jre.getErrorMessage().getMessage() != null
+                     && jre.getErrorMessage().getMessage().contains("pruned")) {
+@@ -434,6 +434,29 @@ public class BitcoindClient {
+ 
+         VerboseBlock vb = withRetry(() -> bitcoindService.getVerboseBlock(blockHash, 3));
+ 
++        Map<BlockTransaction, byte[]> eligibleTransactions = getVerboseBlockTweaks(height, vb, hexFormat);
++        if(eligibleTransactions == null) {
++            if(pruned) {
++                //the legacy path would look the prevout up with getrawtransaction, which needs -txindex: no undo data for this block
++                //means the node cannot serve it, which is what a pruned block is
++                throw new PrunedBlockException(height, pruneHeight, null);
++            }
++            log.warn("getblock verbosity=3 returned no prevout for an input at height {} - falling back to legacy per-input fetch for this block", height);
++            indexBlockLegacy(height, hexFormat);
++            return;
++        }
++
++        blocksIndex.addToIndex(height, Sha256Hash.wrap(blockHash).getBytes(), eligibleTransactions);
++    }
++
++    /**
++     * The tweaks of a block read with getblock verbosity 3, whose inputs carry their prevouts. Fills the scriptPubKey cache with the
++     * block's outputs and prevouts as it goes.
++     *
++     * @return the block's eligible transactions and their tweaks, or null if an eligible transaction's input came without its prevout
++     * (the node has no undo data for the block)
++     */
++    Map<BlockTransaction, byte[]> getVerboseBlockTweaks(int height, VerboseBlock vb, HexFormat hexFormat) {
+         Map<BlockTransaction, byte[]> eligibleTransactions = new LinkedHashMap<>();
+         for(VerboseBlock.VerboseTransaction vtx : vb.tx()) {
+             //fast path: populate the scriptPubKey cache and check the taproot-output gate directly from the JSON
+@@ -469,14 +492,7 @@ public class BitcoindClient {
+             }
+ 
+             if(missingPrevout) {
+-                if(pruned) {
+-                    //the legacy path would look the prevout up with getrawtransaction, which needs -txindex: no undo data for this block
+-                    //means the node cannot serve it, which is what a pruned block is
+-                    throw new PrunedBlockException(height, pruneHeight, null);
+-                }
+-                log.warn("getblock verbosity=3 returned no prevout for an input at height {} - falling back to legacy per-input fetch for this block", height);
+-                indexBlockLegacy(height, hexFormat);
+-                return;
++                return null;
+             }
+ 
+             byte[] tweak = SilentPaymentUtils.getTweak(tx, spentScriptPubKeys, false);
+@@ -486,7 +502,7 @@ public class BitcoindClient {
+             }
+         }
+ 
+-        blocksIndex.addToIndex(height, Sha256Hash.wrap(blockHash).getBytes(), eligibleTransactions);
++        return eligibleTransactions;
+     }
+ 
+     private void indexBlockLegacy(int height, HexFormat hexFormat) {
+@@ -804,6 +820,14 @@ public class BitcoindClient {
+         return stopped;
+     }
+ 
++    public boolean isPruned() {
++        return pruned;
++    }
++
++    public boolean isInitialized() {
++        return initialized;
++    }
++
+     public void stop() {
+         stopped = true;
+         timer.cancel();
+@@ -853,7 +877,7 @@ public class BitcoindClient {
+      * Retries a Bitcoin Core request that fails with an I/O error (the RPC client wraps these in IllegalStateException), so a brief
+      * outage such as a restarting RPC proxy doesn't abort indexing. Errors returned by Bitcoin Core itself are not retried.
+      */
+-    private <T> T withRetry(Supplier<T> request) {
++    <T> T withRetry(Supplier<T> request) {
+         for(int attempt = 1; ; attempt++) {
+             try {
+                 return request.get();
+@@ -1064,7 +1088,7 @@ public class BitcoindClient {
+         return blockchainInfo.blocks() == 0 && blockchainInfo.getProgressPercent() == 100;
+     }
+ 
+-    private Script getFromScriptPubKeyCache(HashIndex hashIndex) {
++    Script getFromScriptPubKeyCache(HashIndex hashIndex) {
+         byte[] scriptPubKeyBytes = scriptPubKeyCache.get(hashIndex);
+         if(scriptPubKeyBytes != null) {
+             return new Script(scriptPubKeyBytes);
+@@ -1073,7 +1097,7 @@ public class BitcoindClient {
+         return null;
+     }
+ 
+-    private void addtoScriptPubKeyCache(Sha256Hash txid, int outputIndex, byte[] scriptPubKeyBytes) {
++    void addtoScriptPubKeyCache(Sha256Hash txid, int outputIndex, byte[] scriptPubKeyBytes) {
+         HashIndex hashIndex = new HashIndex(txid, outputIndex);
+         //Only cache if the length of the field matches one of the valid
+         if(getValidScriptType(scriptPubKeyBytes) != null) {
+@@ -1083,7 +1107,7 @@ public class BitcoindClient {
+         }
+     }
+ 
+-    private static boolean containsTaprootOutput(Transaction tx) {
++    static boolean containsTaprootOutput(Transaction tx) {
+         for(TransactionOutput txOutput : tx.getOutputs()) {
+             ScriptType scriptType = getValidScriptType(txOutput.getScriptBytes());
+             if(scriptType == ScriptType.P2TR) {
+diff --git a/src/main/java/com/sparrowwallet/frigate/bitcoind/BitcoindClientService.java b/src/main/java/com/sparrowwallet/frigate/bitcoind/BitcoindClientService.java
+index 7a8284b..35a2897 100644
+--- a/src/main/java/com/sparrowwallet/frigate/bitcoind/BitcoindClientService.java
++++ b/src/main/java/com/sparrowwallet/frigate/bitcoind/BitcoindClientService.java
+@@ -57,6 +57,12 @@ public interface BitcoindClientService {
+     @JsonRpcMethod("getblock")
+     VerboseBlock getVerboseBlock(@JsonRpcParam("blockhash") String blockhash, @JsonRpcParam("verbosity") int verbosity);
+ 
++    @JsonRpcMethod("getblockfrompeer")
++    Object getBlockFromPeer(@JsonRpcParam("blockhash") String blockhash, @JsonRpcParam("peer_id") int peerId);
++
++    @JsonRpcMethod("getpeerinfo")
++    List<PeerInfo> getPeerInfo();
++
+     @JsonRpcMethod("gettxout")
+     TxOut getTxOut(@JsonRpcParam("txid") String txid, @JsonRpcParam("n") int n, @JsonRpcParam("include_mempool") boolean includeMempool);
+ 
+diff --git a/src/main/java/com/sparrowwallet/frigate/bitcoind/PeerInfo.java b/src/main/java/com/sparrowwallet/frigate/bitcoind/PeerInfo.java
+new file mode 100644
+index 0000000..1f98ef7
+--- /dev/null
++++ b/src/main/java/com/sparrowwallet/frigate/bitcoind/PeerInfo.java
+@@ -0,0 +1,16 @@
++package com.sparrowwallet.frigate.bitcoind;
++
++import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
++
++import java.util.List;
++
++/**
++ * The fields of a getpeerinfo entry a backfill needs to choose a peer to ask for an old block: only a peer offering NETWORK (not just
++ * NETWORK_LIMITED, the last 288 blocks) serves one.
++ */
++@JsonIgnoreProperties(ignoreUnknown = true)
++public record PeerInfo(int id, List<String> servicesnames, boolean inbound) {
++    public boolean servesHistoricalBlocks() {
++        return servicesnames != null && servicesnames.contains("NETWORK");
++    }
++}
+diff --git a/src/main/java/com/sparrowwallet/frigate/electrum/RequestHandler.java b/src/main/java/com/sparrowwallet/frigate/electrum/RequestHandler.java
+index a659d6d..b741285 100644
+--- a/src/main/java/com/sparrowwallet/frigate/electrum/RequestHandler.java
++++ b/src/main/java/com/sparrowwallet/frigate/electrum/RequestHandler.java
+@@ -597,6 +597,18 @@ public class RequestHandler implements Runnable, SubscriptionStatus, HeadersDisp
+         }
+     }
+ 
++    @Subscribe
++    public void silentPaymentsBackfillUpdate(SilentPaymentsBackfillUpdate update) {
++        for(SilentPaymentAddressSubscription subscription : silentPaymentsAddressesSubscribed.values()) {
++            //also while the subscription's own historical scan runs: that scan reads the index as it was when it began, so it may not
++            //see these blocks, and a payment reported twice is one payment to the wallet
++            if(subscription.isActive() && subscription.getStartHeight() <= update.toBlockHeight()) {
++                int from = Math.max(update.fromBlockHeight(), subscription.getStartHeight());
++                electrumServerService.getIndexQuerier().startHistoryScan(subscription.getAddress(), from, update.toBlockHeight(), subscription, new WeakReference<>(this), false);
++            }
++        }
++    }
++
+     @Subscribe
+     public void silentPaymentsMempoolIndexAdded(SilentPaymentsMempoolIndexAdded added) {
+         for(SilentPaymentAddressSubscription subscription : silentPaymentsAddressesSubscribed.values()) {
+diff --git a/src/main/java/com/sparrowwallet/frigate/index/Index.java b/src/main/java/com/sparrowwallet/frigate/index/Index.java
+index 531e158..531b4ff 100644
+--- a/src/main/java/com/sparrowwallet/frigate/index/Index.java
++++ b/src/main/java/com/sparrowwallet/frigate/index/Index.java
+@@ -39,6 +39,7 @@ public class Index {
+     public static final String DEFAULT_DB_FILENAME = "frigate.duckdb";
+     private static final String TWEAK_TABLE = "tweak";
+     private static final String INDEXED_BLOCK_TABLE = "indexed_block";
++    private static final String BACKFILL_TABLE = "backfill";
+     public static final int HISTORY_PAGE_SIZE = 100;
+ 
+     private static final String AUDIT_SCAN_KEY_ENV = "FRIGATE_AUDIT_SCAN_KEY";
+@@ -91,6 +92,7 @@ public class Index {
+                 try(Statement stmt = connection.createStatement()) {
+                     stmt.execute("CREATE TABLE IF NOT EXISTS " + TWEAK_TABLE + " (txid BLOB NOT NULL, height INTEGER NOT NULL, tweak_key BLOB NOT NULL, outputs BIGINT[])");
+                     stmt.execute("CREATE TABLE IF NOT EXISTS " + INDEXED_BLOCK_TABLE + " (height INTEGER NOT NULL, block_hash BLOB NOT NULL, singleton BOOLEAN PRIMARY KEY DEFAULT true CHECK (singleton))");
++                    stmt.execute("CREATE TABLE IF NOT EXISTS " + BACKFILL_TABLE + " (target INTEGER NOT NULL, next INTEGER NOT NULL, end_height INTEGER NOT NULL, singleton BOOLEAN PRIMARY KEY DEFAULT true CHECK (singleton))");
+                     return true;
+                 }
+             });
+@@ -307,20 +309,7 @@ public class Index {
+                             appender.append(blkTx.getHeight());
+                             appender.append(transactions.get(blkTx));
+ 
+-                            List<Long> hashPrefixes = new ArrayList<>();
+-                            if(auditScanKey != null) {
+-                                long hashPrefix = getAuditHashPrefix(transactions, blkTx);
+-                                hashPrefixes.add(hashPrefix);
+-                            } else {
+-                                List<TransactionOutput> outputs = blkTx.getTransaction().getOutputs();
+-                                for(TransactionOutput output : outputs) {
+-                                    if(ScriptType.P2TR.isScriptType(output.getScript())) {
+-                                        long hashPrefix = getHashPrefix(ScriptType.P2TR.getPublicKeyFromScript(output.getScript()).getPubKey(), 1);
+-                                        hashPrefixes.add(hashPrefix);
+-                                    }
+-                                }
+-                            }
+-                            appender.append(hashPrefixes.stream().mapToLong(Long::longValue).toArray());
++                            appender.append(getHashPrefixes(transactions, blkTx));
+                             appender.endRow();
+ 
+                             blockHeight = Math.max(blockHeight, blkTx.getHeight());
+@@ -364,6 +353,186 @@ public class Index {
+         }
+     }
+ 
++    private long[] getHashPrefixes(Map<BlockTransaction, byte[]> transactions, BlockTransaction blkTx) {
++        List<Long> hashPrefixes = new ArrayList<>();
++        if(auditScanKey != null) {
++            long hashPrefix = getAuditHashPrefix(transactions, blkTx);
++            hashPrefixes.add(hashPrefix);
++        } else {
++            List<TransactionOutput> outputs = blkTx.getTransaction().getOutputs();
++            for(TransactionOutput output : outputs) {
++                if(ScriptType.P2TR.isScriptType(output.getScript())) {
++                    long hashPrefix = getHashPrefix(ScriptType.P2TR.getPublicKeyFromScript(output.getScript()).getPubKey(), 1);
++                    hashPrefixes.add(hashPrefix);
++                }
++            }
++        }
++        return hashPrefixes.stream().mapToLong(Long::longValue).toArray();
++    }
++
++    /**
++     * A backfill in progress: blocks target to end - 1 are being added below where the index started (end), oldest first, and next is
++     * the next one to add. Every block below next is in the index.
++     */
++    public record BackfillJob(int target, int next, int end) {
++        public boolean isComplete() {
++            return next >= end;
++        }
++    }
++
++    /**
++     * @return the backfill in progress, or null if there is none
++     */
++    public BackfillJob getBackfillJob() {
++        try {
++            return dbManager.executeRead(connection -> {
++                try(PreparedStatement statement = connection.prepareStatement("SELECT target, next, end_height FROM " + BACKFILL_TABLE)) {
++                    ResultSet resultSet = statement.executeQuery();
++                    return resultSet.next() ? new BackfillJob(resultSet.getInt(1), resultSet.getInt(2), resultSet.getInt(3)) : null;
++                }
++            });
++        } catch(Exception e) {
++            throw new IllegalStateException("Error reading the backfill state", e);
++        }
++    }
++
++    public void setBackfillJob(BackfillJob job) {
++        try {
++            dbManager.executeWrite(connection -> {
++                try(PreparedStatement ps = connection.prepareStatement("INSERT INTO " + BACKFILL_TABLE + " (target, next, end_height) VALUES (?, ?, ?) " +
++                        "ON CONFLICT (singleton) DO UPDATE SET target = excluded.target, next = excluded.next, end_height = excluded.end_height")) {
++                    ps.setInt(1, job.target());
++                    ps.setInt(2, job.next());
++                    ps.setInt(3, job.end());
++                    return ps.executeUpdate();
++                }
++            });
++        } catch(Exception e) {
++            throw new IllegalStateException("Error writing the backfill state", e);
++        }
++    }
++
++    public void clearBackfillJob() {
++        try {
++            dbManager.executeWrite(connection -> {
++                try(Statement stmt = connection.createStatement()) {
++                    return stmt.executeUpdate("DELETE FROM " + BACKFILL_TABLE);
++                }
++            });
++        } catch(Exception e) {
++            throw new IllegalStateException("Error clearing the backfill state", e);
++        }
++    }
++
++    /**
++     * Adds one backfilled block, below where the index started, and advances the backfill past it, in one transaction: a stop or crash
++     * leaves either the whole block and the advanced position or neither. Any rows already at this height (from an abandoned backfill
++     * over the same blocks) are replaced, so adding a block twice is harmless. The indexed-block marker, which tracks the tip, is not
++     * touched.
++     */
++    public void addBackfillBlock(int height, Map<BlockTransaction, byte[]> transactions, BackfillJob job) {
++        if(height >= job.end() || height < job.target()) {
++            throw new IllegalArgumentException("Block " + height + " is outside the backfill range " + job.target() + " to " + (job.end() - 1));
++        }
++        try {
++            dbManager.executeWrite(connection -> {
++                boolean prevAutoCommit = connection.getAutoCommit();
++                connection.setAutoCommit(false);
++                try {
++                    try(PreparedStatement delete = connection.prepareStatement("DELETE FROM " + TWEAK_TABLE + " WHERE height = ?")) {
++                        delete.setInt(1, height);
++                        delete.execute();
++                    }
++                    if(!transactions.isEmpty()) {
++                        try(PreparedStatement insert = connection.prepareStatement("INSERT INTO " + TWEAK_TABLE + " (txid, height, tweak_key, outputs) VALUES (?, ?, ?, ?)")) {
++                            for(BlockTransaction blkTx : transactions.keySet()) {
++                                if(blkTx.getHeight() != height) {
++                                    throw new SQLException("Transaction " + blkTx.getHash() + " is at height " + blkTx.getHeight() + ", not " + height);
++                                }
++                                long[] prefixes = getHashPrefixes(transactions, blkTx);
++                                Long[] boxed = new Long[prefixes.length];
++                                for(int i = 0; i < prefixes.length; i++) {
++                                    boxed[i] = prefixes[i];
++                                }
++                                insert.setBytes(1, blkTx.getTransaction().getTxId().getBytes());
++                                insert.setInt(2, height);
++                                insert.setBytes(3, transactions.get(blkTx));
++                                insert.setArray(4, connection.createArrayOf("BIGINT", boxed));
++                                insert.addBatch();
++                            }
++                            insert.executeBatch();
++                        }
++                    }
++                    try(PreparedStatement ps = connection.prepareStatement("INSERT INTO " + BACKFILL_TABLE + " (target, next, end_height) VALUES (?, ?, ?) " +
++                            "ON CONFLICT (singleton) DO UPDATE SET target = excluded.target, next = excluded.next, end_height = excluded.end_height")) {
++                        ps.setInt(1, job.target());
++                        ps.setInt(2, height + 1);
++                        ps.setInt(3, job.end());
++                        ps.executeUpdate();
++                    }
++                    connection.commit();
++                    return true;
++                } catch(SQLException e) {
++                    connection.rollback();
++                    throw e;
++                } finally {
++                    connection.setAutoCommit(prevAutoCommit);
++                }
++            });
++        } catch(Exception e) {
++            throw new IllegalStateException("Error adding backfilled block " + height + " to the index", e);
++        }
++    }
++
++    int countTweakRows(int fromHeight, int toHeight) {
++        try {
++            return dbManager.executeRead(connection -> {
++                try(PreparedStatement statement = connection.prepareStatement("SELECT COUNT(*) FROM " + TWEAK_TABLE + " WHERE height >= ? AND height <= ?")) {
++                    statement.setInt(1, fromHeight);
++                    statement.setInt(2, toHeight);
++                    ResultSet resultSet = statement.executeQuery();
++                    return resultSet.next() ? resultSet.getInt(1) : 0;
++                }
++            });
++        } catch(Exception e) {
++            throw new IllegalStateException(e);
++        }
++    }
++
++    /**
++     * @return the first block this index covers, as recorded beside the database, or -1 if it is not recorded
++     */
++    public int readStartHeight() {
++        if(dbManager instanceof MemoryDbManager) {
++            return -1;
++        }
++        File file = new File(Storage.getFrigateDbDir(), START_HEIGHT_FILENAME);
++        try {
++            return file.exists() ? Integer.parseInt(Files.readString(file.toPath()).trim()) : -1;
++        } catch(IOException | NumberFormatException e) {
++            log.warn("Could not read " + file, e);
++            return -1;
++        }
++    }
++
++    /**
++     * Records a new first block for this index, once a backfill has filled every block from it up to the old one. Written to a new file
++     * that then replaces the old, so a crash leaves one or the other.
++     */
++    public void writeStartHeight(int startHeight) {
++        if(dbManager instanceof MemoryDbManager) {
++            return;
++        }
++        File file = new File(Storage.getFrigateDbDir(), START_HEIGHT_FILENAME);
++        File tmp = new File(Storage.getFrigateDbDir(), START_HEIGHT_FILENAME + ".tmp");
++        try {
++            Files.writeString(tmp.toPath(), startHeight + "\n");
++            Files.move(tmp.toPath(), file.toPath(), java.nio.file.StandardCopyOption.REPLACE_EXISTING, java.nio.file.StandardCopyOption.ATOMIC_MOVE);
++        } catch(IOException e) {
++            throw new IllegalStateException("Could not write " + file, e);
++        }
++    }
++
+     private long getAuditHashPrefix(Map<BlockTransaction, byte[]> transactions, BlockTransaction blkTx) {
+         byte[] tweakKeyBytes = transactions.get(blkTx);
+         ECKey tweakKey = ECKey.fromPublicOnly(compressRawKey(tweakKeyBytes));
+diff --git a/src/main/java/com/sparrowwallet/frigate/index/SilentPaymentsBackfillUpdate.java b/src/main/java/com/sparrowwallet/frigate/index/SilentPaymentsBackfillUpdate.java
+new file mode 100644
+index 0000000..6574e51
+--- /dev/null
++++ b/src/main/java/com/sparrowwallet/frigate/index/SilentPaymentsBackfillUpdate.java
+@@ -0,0 +1,8 @@
++package com.sparrowwallet.frigate.index;
++
++/**
++ * Blocks fromBlockHeight to toBlockHeight, below where the index started, have been added by a backfill. Wallets whose scan covers
++ * any of them are scanned over just these blocks, so payments found there reach them without a rescan.
++ */
++public record SilentPaymentsBackfillUpdate(int fromBlockHeight, int toBlockHeight) {
++}
+diff --git a/src/main/java/com/sparrowwallet/frigate/io/Config.java b/src/main/java/com/sparrowwallet/frigate/io/Config.java
+index fd71b8c..47a1b34 100644
+--- a/src/main/java/com/sparrowwallet/frigate/io/Config.java
++++ b/src/main/java/com/sparrowwallet/frigate/io/Config.java
+@@ -369,8 +369,41 @@ public class Config {
+     @JsonIgnoreProperties(ignoreUnknown = true)
+     @JsonInclude(JsonInclude.Include.NON_NULL)
+     public static class IndexConfig {
++        public static final int BACKFILL_IN_FLIGHT_BACKGROUND = 4;
++        public static final int BACKFILL_IN_FLIGHT_FULL = 32;
++
+         private Integer startHeight;
+         private String cacheSize;
++        private Integer backfillFromHeight;
++        private String backfillSpeed;
++
++        /**
++         * @return the block a backfill looks back to, below where the index starts, or null for no backfill
++         */
++        public Integer getBackfillFromHeight() {
++            return backfillFromHeight;
++        }
++
++        public void setBackfillFromHeight(Integer backfillFromHeight) {
++            this.backfillFromHeight = backfillFromHeight;
++        }
++
++        public String getBackfillSpeed() {
++            return backfillSpeed;
++        }
++
++        public void setBackfillSpeed(String backfillSpeed) {
++            this.backfillSpeed = backfillSpeed;
++        }
++
++        /**
++         * @return how many prevout lookups a backfill keeps in flight: "full" for throughput, anything else (the default,
++         * "background") for a light load on the indexer, the network and the machine
++         */
++        @JsonIgnore
++        public int getBackfillInFlight() {
++            return "full".equalsIgnoreCase(backfillSpeed) ? BACKFILL_IN_FLIGHT_FULL : BACKFILL_IN_FLIGHT_BACKGROUND;
++        }
+ 
+         public Integer getStartHeight() {
+             return startHeight;
+diff --git a/src/test/java/com/sparrowwallet/frigate/bitcoind/BackfillJobTest.java b/src/test/java/com/sparrowwallet/frigate/bitcoind/BackfillJobTest.java
+new file mode 100644
+index 0000000..7495bcc
+--- /dev/null
++++ b/src/test/java/com/sparrowwallet/frigate/bitcoind/BackfillJobTest.java
+@@ -0,0 +1,117 @@
++package com.sparrowwallet.frigate.bitcoind;
++
++import com.sparrowwallet.drongo.protocol.Sha256Hash;
++import com.sparrowwallet.frigate.Frigate;
++import com.sparrowwallet.frigate.index.Index;
++import com.sparrowwallet.frigate.io.Config;
++import com.sparrowwallet.frigate.io.Server;
++import com.sparrowwallet.frigate.io.Storage;
++import org.junit.jupiter.api.AfterEach;
++import org.junit.jupiter.api.BeforeEach;
++import org.junit.jupiter.api.Test;
++import org.junit.jupiter.api.io.TempDir;
++
++import java.nio.file.Path;
++import java.util.Map;
++
++import static org.junit.jupiter.api.Assertions.*;
++
++/**
++ * Which backfill runs, from the configured block and the recorded state.
++ */
++public class BackfillJobTest {
++    @TempDir
++    Path tempDir;
++
++    private String previousHome;
++    private Index index;
++
++    @BeforeEach
++    public void setUp() {
++        previousHome = System.getProperty(Frigate.APP_HOME_PROPERTY);
++        System.setProperty(Frigate.APP_HOME_PROPERTY, tempDir.resolve("home").toString());
++        resetExtensionFile();
++        Config config = new Config();
++        config.getDatabase().setUrl("jdbc:duckdb:" + tempDir.resolve("frigate.duckdb"));
++        Config.setInstance(config);
++        index = new Index(1000, false, 1000);
++        //an index that started at 1000, as a pruned node's does
++        assertEquals(1000, index.recordStartHeight(1000));
++        index.addToIndex(1000, Sha256Hash.ZERO_HASH.getBytes(), Map.of());
++    }
++
++    @AfterEach
++    public void tearDown() {
++        index.close();
++        Config.setInstance(null);
++        if(previousHome == null) {
++            System.clearProperty(Frigate.APP_HOME_PROPERTY);
++        } else {
++            System.setProperty(Frigate.APP_HOME_PROPERTY, previousHome);
++        }
++    }
++
++    private Backfill backfill(int minHeight) {
++        return new Backfill(null, index, minHeight, new Server("tcp://127.0.0.1:1"), null, 4);
++    }
++
++    @Test
++    public void startsResumesAndReplaces() {
++        assertNull(backfill(0).resolveJob(null));
++        assertNull(index.getBackfillJob());
++
++        Index.BackfillJob job = backfill(0).resolveJob(900);
++        assertEquals(new Index.BackfillJob(900, 900, 1000), job);
++        assertEquals(job, index.getBackfillJob());
++
++        index.addBackfillBlock(900, Map.of(), job);
++        assertEquals(new Index.BackfillJob(900, 901, 1000), backfill(0).resolveJob(900));
++
++        //turned off: nothing runs, and the position is kept for turning it back on
++        assertNull(backfill(0).resolveJob(null));
++        assertEquals(new Index.BackfillJob(900, 901, 1000), index.getBackfillJob());
++
++        //another block: a new backfill from it
++        assertEquals(new Index.BackfillJob(950, 950, 1000), backfill(0).resolveJob(950));
++    }
++
++    @Test
++    public void clampsToTheLowestUsefulBlock() {
++        assertEquals(new Index.BackfillJob(950, 950, 1000), backfill(950).resolveJob(10));
++        assertNull(backfill(1000).resolveJob(10));
++    }
++
++    @Test
++    public void nothingToDoAtOrAboveTheStart() {
++        index.setBackfillJob(new Index.BackfillJob(900, 950, 1000));
++        assertNull(backfill(0).resolveJob(1000));
++        assertNull(index.getBackfillJob());
++    }
++
++    @Test
++    public void finishesABackfillThatCompletedBeforeAStop() throws Exception {
++        index.setBackfillJob(new Index.BackfillJob(900, 1000, 1000));
++        assertNull(backfill(0).resolveJob(900));
++        assertNull(index.getBackfillJob());
++        assertEquals(900, index.readStartHeight());
++        assertEquals("900", java.nio.file.Files.readString(Storage.getFrigateDbDir().toPath().resolve(Index.START_HEIGHT_FILENAME)).trim());
++
++        //and a lower block later fills only the new range
++        assertEquals(new Index.BackfillJob(800, 800, 900), backfill(0).resolveJob(800));
++    }
++
++    /**
++     * Storage extracts the scanning extension once per JVM, under the home of whichever test ran first, which a test before this one
++     * may have deleted with its temporary directory: extract it again under this test's home.
++     */
++    static void resetExtensionFile() {
++        try {
++            java.lang.reflect.Field field = com.sparrowwallet.frigate.io.Storage.class.getDeclaredField("ufsecpExtensionFile");
++            field.setAccessible(true);
++            field.set(null, null);
++            com.sparrowwallet.frigate.io.Storage.getFrigateDbDir().mkdirs();
++        } catch(ReflectiveOperationException e) {
++            throw new IllegalStateException(e);
++        }
++    }
++}
+diff --git a/src/test/java/com/sparrowwallet/frigate/bitcoind/BackfillVerifyTest.java b/src/test/java/com/sparrowwallet/frigate/bitcoind/BackfillVerifyTest.java
+new file mode 100644
+index 0000000..38bebc4
+--- /dev/null
++++ b/src/test/java/com/sparrowwallet/frigate/bitcoind/BackfillVerifyTest.java
+@@ -0,0 +1,103 @@
++package com.sparrowwallet.frigate.bitcoind;
++
++import com.sparrowwallet.drongo.protocol.Block;
++import com.sparrowwallet.drongo.protocol.Transaction;
++import org.junit.jupiter.api.Test;
++
++import java.io.IOException;
++import java.io.InputStream;
++import java.nio.charset.StandardCharsets;
++import java.util.HexFormat;
++import java.util.List;
++
++import static org.junit.jupiter.api.Assertions.*;
++
++/**
++ * Block 980821 on the BLAKE2b chain: a v2 (164 byte) header, segwit and taproot spends, and a witness commitment. A block fetched from
++ * peers is checked against its header before its transactions are used.
++ */
++public class BackfillVerifyTest {
++    private static final String HASH = "00000000000000004918e0727c94c4c2a5507f00b646e5d10c3664ba76485910";
++
++    private static byte[] blockBytes() throws IOException {
++        try(InputStream in = BackfillVerifyTest.class.getResourceAsStream("block-980821.hex")) {
++            return HexFormat.of().parseHex(new String(in.readAllBytes(), StandardCharsets.US_ASCII).trim());
++        }
++    }
++
++    @Test
++    public void acceptsTheRealBlock() throws IOException {
++        Block block = new Block(blockBytes());
++        assertTrue(block.getBlockHeader().isV2());
++        assertEquals(HASH, block.getHash().toString());
++        assertDoesNotThrow(() -> Backfill.verifyBlock(block, HASH));
++    }
++
++    @Test
++    public void refusesAnotherBlockHash() throws IOException {
++        Block block = new Block(blockBytes());
++        Exception e = assertThrows(IllegalStateException.class, () -> Backfill.verifyBlock(block, "00".repeat(32)));
++        assertTrue(e.getMessage().contains("hashes to"));
++    }
++
++    @Test
++    public void refusesAChangedWitness() throws IOException {
++        byte[] bytes = blockBytes();
++        //the last byte of the last witness item of a segwit transaction: before its 4 byte locktime. It changes the wtxid, not the txid
++        Transaction segwit = segwitTransaction(new Block(bytes));
++        byte[] serialized = segwit.bitcoinSerialize();
++        int offset = indexOf(bytes, serialized);
++        assertTrue(offset > 0);
++        bytes[offset + serialized.length - 5] ^= 0x01;
++
++        Block tampered = new Block(bytes);
++        assertEquals(segwit.getTxId(), segwitTransaction(tampered).getTxId());
++        Exception e = assertThrows(IllegalStateException.class, () -> Backfill.verifyBlock(tampered, HASH));
++        assertTrue(e.getMessage().contains("witness commitment"), e.getMessage());
++    }
++
++    @Test
++    public void refusesAChangedTransaction() throws IOException {
++        byte[] bytes = blockBytes();
++        Transaction segwit = segwitTransaction(new Block(bytes));
++        byte[] serialized = segwit.bitcoinSerialize();
++        int offset = indexOf(bytes, serialized);
++        //the locktime, which the txid covers
++        bytes[offset + serialized.length - 1] ^= 0x01;
++
++        Block tampered = new Block(bytes);
++        Exception e = assertThrows(IllegalStateException.class, () -> Backfill.verifyBlock(tampered, HASH));
++        assertTrue(e.getMessage().contains("Merkle root"), e.getMessage());
++    }
++
++    @Test
++    public void merkleRootOfOneLeafIsTheLeaf() {
++        byte[] leaf = new byte[32];
++        leaf[0] = 7;
++        assertArrayEquals(leaf, Backfill.merkleRoot(List.of(leaf)));
++    }
++
++    @Test
++    public void formatsDurations() {
++        assertEquals("1m", Backfill.formatDuration(5));
++        assertEquals("2h 5m", Backfill.formatDuration(2 * 3600 + 300));
++        assertEquals("3d 4h", Backfill.formatDuration(3 * 86400 + 4 * 3600 + 10));
++    }
++
++    private static Transaction segwitTransaction(Block block) {
++        return block.getTransactions().stream().skip(1).filter(Transaction::hasWitnesses).findFirst().orElseThrow();
++    }
++
++    private static int indexOf(byte[] haystack, byte[] needle) {
++        outer:
++        for(int i = 0; i <= haystack.length - needle.length; i++) {
++            for(int j = 0; j < needle.length; j++) {
++                if(haystack[i + j] != needle[j]) {
++                    continue outer;
++                }
++            }
++            return i;
++        }
++        return -1;
++    }
++}
+diff --git a/src/test/java/com/sparrowwallet/frigate/index/IndexBackfillTest.java b/src/test/java/com/sparrowwallet/frigate/index/IndexBackfillTest.java
+new file mode 100644
+index 0000000..8381f27
+--- /dev/null
++++ b/src/test/java/com/sparrowwallet/frigate/index/IndexBackfillTest.java
+@@ -0,0 +1,118 @@
++package com.sparrowwallet.frigate.index;
++
++import com.sparrowwallet.drongo.protocol.Sha256Hash;
++import com.sparrowwallet.drongo.protocol.Transaction;
++import com.sparrowwallet.drongo.wallet.BlockTransaction;
++import com.sparrowwallet.frigate.Frigate;
++import com.sparrowwallet.frigate.io.Config;
++import org.junit.jupiter.api.AfterEach;
++import org.junit.jupiter.api.BeforeEach;
++import org.junit.jupiter.api.Test;
++import org.junit.jupiter.api.io.TempDir;
++
++import java.nio.file.Path;
++import java.util.LinkedHashMap;
++import java.util.Map;
++
++import static org.junit.jupiter.api.Assertions.*;
++
++public class IndexBackfillTest {
++    @TempDir
++    Path tempDir;
++
++    private String previousHome;
++
++    @BeforeEach
++    public void setUp() {
++        previousHome = System.getProperty(Frigate.APP_HOME_PROPERTY);
++        System.setProperty(Frigate.APP_HOME_PROPERTY, tempDir.resolve("home").toString());
++        resetExtensionFile();
++        Config config = new Config();
++        config.getDatabase().setUrl("jdbc:duckdb:" + tempDir.resolve("frigate.duckdb"));
++        Config.setInstance(config);
++    }
++
++    @AfterEach
++    public void tearDown() {
++        Config.setInstance(null);
++        if(previousHome == null) {
++            System.clearProperty(Frigate.APP_HOME_PROPERTY);
++        } else {
++            System.setProperty(Frigate.APP_HOME_PROPERTY, previousHome);
++        }
++    }
++
++    private static Map<BlockTransaction, byte[]> block(int height, int count) {
++        Map<BlockTransaction, byte[]> txs = new LinkedHashMap<>();
++        for(int i = 0; i < count; i++) {
++            Transaction tx = new Transaction();
++            tx.setLocktime(height * 100L + i);
++            txs.put(new BlockTransaction(tx.getTxId(), height, null, 0L, tx, null), new byte[64]);
++        }
++        return txs;
++    }
++
++    @Test
++    public void addsBackfilledBlocksBelowTheTipWithoutMovingIt() {
++        Index index = new Index(1000, false, 1000);
++        try {
++            index.addToIndex(1000, Sha256Hash.ZERO_HASH.getBytes(), block(1000, 1));
++            assertNull(index.getBackfillJob());
++
++            Index.BackfillJob job = new Index.BackfillJob(990, 990, 1000);
++            index.setBackfillJob(job);
++            index.addBackfillBlock(990, block(990, 2), job);
++            assertEquals(new Index.BackfillJob(990, 991, 1000), index.getBackfillJob());
++            assertEquals(2, index.countTweakRows(990, 990));
++            assertEquals(1000, index.getLastBlockIndexed());
++
++            //again, as after an abandoned backfill over the same block: replaced, not added twice
++            index.addBackfillBlock(990, block(990, 2), job);
++            assertEquals(2, index.countTweakRows(990, 990));
++
++            index.addBackfillBlock(991, Map.of(), new Index.BackfillJob(990, 991, 1000));
++            assertEquals(new Index.BackfillJob(990, 992, 1000), index.getBackfillJob());
++
++            assertThrows(IllegalArgumentException.class, () -> index.addBackfillBlock(1000, block(1000, 1), job));
++            assertThrows(IllegalArgumentException.class, () -> index.addBackfillBlock(989, block(989, 1), job));
++
++            index.clearBackfillJob();
++            assertNull(index.getBackfillJob());
++            assertEquals(1, index.countTweakRows(1000, 1000));
++        } finally {
++            index.close();
++        }
++    }
++
++    @Test
++    public void keepsTheBackfillAcrossARestart() {
++        Index index = new Index(1000, false, 1000);
++        Index.BackfillJob job = new Index.BackfillJob(990, 990, 1000);
++        index.setBackfillJob(job);
++        index.addBackfillBlock(990, block(990, 1), job);
++        index.close();
++
++        Index restarted = new Index(1000, false, 1000);
++        try {
++            assertEquals(new Index.BackfillJob(990, 991, 1000), restarted.getBackfillJob());
++            assertEquals(1, restarted.countTweakRows(990, 990));
++        } finally {
++            restarted.close();
++        }
++    }
++
++    /**
++     * Storage extracts the scanning extension once per JVM, under the home of whichever test ran first, which a test before this one
++     * may have deleted with its temporary directory: extract it again under this test's home.
++     */
++    static void resetExtensionFile() {
++        try {
++            java.lang.reflect.Field field = com.sparrowwallet.frigate.io.Storage.class.getDeclaredField("ufsecpExtensionFile");
++            field.setAccessible(true);
++            field.set(null, null);
++            com.sparrowwallet.frigate.io.Storage.getFrigateDbDir().mkdirs();
++        } catch(ReflectiveOperationException e) {
++            throw new IllegalStateException(e);
++        }
++    }
++}
+diff --git a/src/test/java/com/sparrowwallet/frigate/index/IndexResumeTest.java b/src/test/java/com/sparrowwallet/frigate/index/IndexResumeTest.java
+index d72061f..ec86d53 100644
+--- a/src/test/java/com/sparrowwallet/frigate/index/IndexResumeTest.java
++++ b/src/test/java/com/sparrowwallet/frigate/index/IndexResumeTest.java
+@@ -32,6 +32,7 @@ public class IndexResumeTest {
+         //the index extracts the scanning extension under Frigate's home, so keep it out of the real one
+         previousHome = System.getProperty(Frigate.APP_HOME_PROPERTY);
+         System.setProperty(Frigate.APP_HOME_PROPERTY, tempDir.resolve("home").toString());
++        IndexBackfillTest.resetExtensionFile();
+         Config config = new Config();
+         config.getDatabase().setUrl("jdbc:duckdb:" + tempDir.resolve("frigate.duckdb"));
+         Config.setInstance(config);
+diff --git a/src/test/resources/com/sparrowwallet/frigate/bitcoind/block-980821.hex b/src/test/resources/com/sparrowwallet/frigate/bitcoind/block-980821.hex
+new file mode 100644
+index 0000000..81278ab
+--- /dev/null
++++ b/src/test/resources/com/sparrowwallet/frigate/bitcoind/block-980821.hex
+@@ -0,0 +1 @@
++000000a02ea0a2a3e0c19848d2dd1ebd7439316692328ff0a7aec684000000000000000048bbb10768805ca47d212710b95512fa15af9ef3633550b7614a4b29c982441a8362ee6a98ad0019e21d71e7b4b806380000000000000000b10cf00d0e0000000000000000000000110000000000000000000000000000000000000055f70e00000000000000000000000000000000000000000000000000000000000000000011010000000001010000000000000000000000000000000000000000000000000000000000000000ffffffff400355f70e20416c706861506f6f6c0f4c6f76652053686974636f696e2048617368657273000b1192100150de71000000000eb776000000000000000000000000ffffffff8ba80a8b01000000001976a914724cb54fc624f60a315b881bf3cb112502dbef5588ac9ef68001000000001976a914cb877f0e8ff562f3527ea43920f290746159ae6888ac50ef2201000000001600149f9a12d989dd5d329fa85184e530423d2ee95d339a7a0f01000000001976a91422e6c28ffd83a88f99019e9c5d488cde922ac22a88acb415e400000000001976a9144cee3cbb4deaf3d3e78e027f5d3fee2902334a6188acf643d200000000001600142037d4d3d294373e41d062ec8bf7a4378a6b69caeb1db000000000001976a91498e23efad677cd430ff47783771ecd76d4f368f988acf471af00000000001976a9147a745046410dcda5bc9ab788841347340832832d88acbd249900000000001976a914e2524a8d0808f456ca39edffbc18ef432a996caa88ac0b777b00000000001976a914f7aa0c08d84a1740dc2b782cc71f58c683c3ea8c88ac6cee640000000000160014e31bb4028534e51806c0db8c5708b08ebd46c90c1339640000000000160014829bfcf15b8aba702f544cb18c43749352d1dc1658956000000000001976a9141a359cd5c063ed95f5c27211db20a76444c6c0c988ace5175f00000000001976a91471cd61ccde763018a5f917a35758bc52107ebe0888ac9f0a5d00000000001976a91401584dfa45095c72505deb9648dcbdd64e5bc78888ac9d595700000000001976a9142b49e70befb3729333077eb729a30fbd0d485d0888ac09e25400000000001600146919214608d0af236e8eb20da60b37581afdcf13aafa5300000000001976a914b20ea4ae4f0544c3eea90cc27005c031c439a94988ac1bd04e0000000000160014e1c7ed765aa41f35d563a1a815767318820fa9e43c444800000000001976a914333be096cb0464d75f466d658165741560ed384588acbf7b4600000000001976a9143a5be6a55a80de1bca4b17e7a4dedd13a80931cc88ac7b994200000000001976a914d716715f68dfb72d9bc48dc2145ebdabe95c2d7088ac11704000000000001976a9145ca27b36f3ec6e1f796c88870b7e9dbf0efe588788ac92c23b00000000001976a9147d35fbf9dd8fe34279c47a935f5657f2b4f5003788ac645b3b00000000001976a9148a308a9e8b45ab7e230d07faaf2bd565308558a688ac36f43a0000000000160014ddd5de83d6f3eda60d27d76648fec3fcb0c6163d28502e00000000001976a914a172b848cec02525fce4d7bcdca9c1735c87792c88acb5382e00000000001976a9143dc4c2c6dc235bcb5129e9967ccc83859c00c26888ac444c2c0000000000160014fa7412e04cca1ea3f3977f6029d956e895b44b3fa6892900000000001976a9142a25f28fe156472f39179bac184adf38bc76d59b88ac45f12200000000001976a91495640c6976ade5e6da44fda77ba14c09c807804e88acf46d2200000000001976a914dfc7fd5068a07e545bd3ea212d4237be98c1680088ac68162200000000001976a914e5b3f88fe4bf0837c63496b41ea7aec4d23a6ed588acf1881f00000000001976a9143fb18958113d5f9a2fc43dff67ce6bb5da02df8588ac55f11a00000000001976a914ad9a00c9bd95c467b73b48b979f80e86fc9f0d8c88ac7b2f1a0000000000160014a3c61e143f8e426fbe8a5f5ddc50322b0c31b08de49518000000000016001421005dc3917acf4ff8775adc251593f3e708841e383b180000000000160014f0e30b5218f953174fe8fe5abe366d0412da56df352218000000000016001430fab9a40f4abbfacc99a7723708ed9659a4482c32461400000000001976a91477b2eab6ad43b3b4602fba03967bb25d93753bd988ac65e8130000000000160014f74922984839c82869a0292c52a65f71543d42a1e4db1300000000001976a914c7faeff270c4bac549ba073139bec76300eb8c2c88acc3d81300000000001976a9145f66f51e9febedbb0b7271305f55453e174079cc88ac21c91300000000001976a914273d8266f4ca93a1bb7996f389f723492dd73dc488ac21c9130000000000160014d2798a96759d42490b3e0fd9185e46ec72a87b3f9fbc1300000000001976a914d8a6f11c88cceb9e096f3fcb6da8000bc203c5cb88ac1a971300000000001976a914dbe6304e28abf43ec4b74bf0067bf69701ab1ffa88ac34681300000000001976a9141c7ce63695e2d92b839fc6459755851d903a042288ac4b20130000000000160014e9478189e77bbbe579ff925258c5f683404e2ccd55b81200000000001976a91436e79d4e30d911b515aed7dc82db281fd944ff0d88ac7dcb110000000000160014182ee9b64917679f629bea2b28e7a041ce7e4e8ecd601000000000001976a9140c196e3a6cce18e5b8eacef0d809631b8d3ea70488acc9500f000000000016001467ffd56c1c0120286497b15ccea87ad6280a345ac6370f0000000000160014c7ddf99199322ee036743e653a52cf70a506721f66bf0e00000000001976a9145bb0e9fafcda9d003087aaeadabeb23ce0bbd9a388acec750e00000000001976a914825a8a7386a19a7fcda9e1404929086058bdcb8188ac73bd0d00000000001976a91438989afdc52a6a697824393d84b71e8400abe27488acbd170d000000000016001432ae128a8f51297a7fbd4323a0b09223885f9c94b3cc0c0000000000160014c1266aa8ce8414a5b3ef023d84a038aef9f6cfe401400c0000000000160014022f633e89fec9c73a01616e654ca99b5b14a453cad10b00000000001976a914f152c27d2a3bde2403865078581a121796e698c888acdf450b00000000001600141d8613ea3846b1dbf36f112efb125a41edd0159b1d330b000000000016001416b0b3f23ebff7dc7a96c8ca65634d3a733f2670f5b90a00000000001976a914801676d213516156edf0d3e44f064d15717670ec88ac69af0900000000001976a91462bff4f76409245f18b1bcc6609df43db8c88da288ac28a90900000000001976a914ba15e2e162a66ad2e3faf867e2000f287cca0c9488ac1b450900000000001976a9146b64fda54295fe61ffd0cf082704304f771e5a5a88ac4bce0800000000001976a914a2c7b7bf414861f173b5b6439671e11937308c6188acd9470800000000001600140117223e707b7fa66e79d0887d5b432c4b5e4b0600860700000000001976a91489a6cf767be468f818c50ef7a0848a357daeb30288acb84d070000000000160014f6975e9fee14d440f805c018f5f08048405b3af036410700000000001976a9149110839872d262c2bae8f844067311a7cf9a30dc88acbe88060000000000160014afcb3135c407bc74b45c350dee5f1166425c13677d820600000000001976a9144155aabc05c7fd4b31d5ae53726a38ebdb1f866888acf5430600000000001600148a9890e9217b46fa089e29be5b4775cab93fc7bff543060000000000160014c774fe5b876411e851edc996c79da0e0d0a414bf4c0206000000000016001410a5ffd30cd24242a078e6eae781a546c8d5f13f45d0050000000000160014d666a8139fe972105207aa5a4a250d362952b2ef89f80400000000001600140048dc5b9b89467c20224ee6bf6b48d6185c65e307ec0400000000001976a9149f8077926d1b57f3dd0dd14ac1ef0a155a601ada88ac62c30400000000001976a91467af2a97bbd2b6fbbcd384c2b9cd66a0c0bdf55c88ac71490400000000001976a9140e0d893688848f2fa1b80579058766ed0207e73f88ac0d270400000000001600146bb8cbfc7771a2a35170fe1607b9bd0482bac50ba5eb0300000000001976a9147fefefb9f63de146924ac2f71bee138dd7f03a1088ac9eb903000000000016001448477449f1361f563ba3c1d795acf53c2607693b0c30030000000000160014797509597529376628eccdc6adb961cc9c6df51db42d0300000000001976a9140ed93da5284214f0b40044c93898c7a8036ea76088ac61190300000000001976a9141f391b5e13ab3ff4c4cae28be7fecd57f70b952f88ac2601030000000000160014b030b65fede445bc1e5c2eb6c236f3f59df4d23b1fcf0200000000001976a914259c8760cf617ef75904ae5522cd94d169e94e9988ac9dc2020000000000160014605ea1d5a5c9f418e94dc84a20a8b02635b7c3175dbc0200000000001976a914d35192e7698558436dcd0508a3d570e641a6db5b88ac3f8e020000000000160014a5d198266d463a81bf362033126305365130238fa7160200000000001600146c72bda3910b4395536190ba9618dadb1ad5e14e05070200000000001976a91410ca3220d846a7e9b0ed24d5df0a0f41adf765ca88ac62f7010000000000160014266ff0950d0bb71ce73d3f611da4edfcbacc3c6442f4010000000000160014d4d1c49bb3b948d89cc8f9a749ff3ff099c3305501ee01000000000016001463401b8fa0707418396664edfc7c323c4d9128071bbf010000000000160014d4f925ebc1bae2c8b9de0d8fcfb582f451b3f1c979af010000000000160014ff9a3c53650101435988f06480662b2facabcd83d386010000000000160014cf0ef17f00761cc1383ebf12fe0a47671dff7ee543850100000000001976a914cb4351abe9f7cd1a6d29dd7f91a4ae4c892532f788acd06d010000000000160014a1e99dd5d3a14ba4c048fe1d243b171b875a2740b06a0100000000001976a9143743d5dbbbd7fb1acaf75b97feb75db0800c802a88acc93b0100000000001976a914b82f5e99caa88f134335ed5cab40435eaf82938a88aca61f01000000000016001408972bb971eb04c996d9d42f1b0c89c213e1db174516010000000000160014fa27ce9b014906e9920a945ca3eb560b0b349184a20601000000000016001449585f2eff03660e64e26a2c196bc1ce483cff9a00f700000000000016001401d71a17da46e82a6bb353c654a35a54e3020dd55ee70000000000001976a914bde3ac84ba32d28d42270a9b937e3e4dca9cce1a88ac5ee70000000000001600142eaa2da6f7ffefa7b2d2be24ac98c7dd0d3d4aa8c5de0000000000001600142d7b196b698564f0117e74a9217a9493ea35344c20b6000000000000160014841ae46d3ca2d9f47472b4e813b26f69f81a1b50549c0000000000001976a914f55cef4b6526134a30900a1f6223ea412ec1b2ca88ac1396000000000000160014badbfcdd168c9f00038aa611e04a548c4877a673228b000000000000160014ea520ec3c7c110a57fee41bd51b05b90fc123aa53180000000000000160014c889f6032b57040cb25669ea0057b7650879e96b107d0000000000001976a9144429e9e16d23e7bfa9e1cbc846438da838545eea88accc5d000000000000160014f5cc23a7cb1fcf63b9586f515175873a869d77d7cc5d000000000000160014ba37543bef896ba69bfbe458a922b93e00066ac7094b000000000000160014c63c1837da2e000c4441ec5a90b9ef7fc85987e6094b000000000000160014c2cfa09d049e10b9c7190a6f3aeae9ee19dd7154c944000000000000160014e893a53621f80c971e852fae2929d955490a5d2da841000000000000160014d6d6ebd4c014f3ad21f8738b699a567e3909ebb8503f000000000000160014122aff1f30035dc56725b446b527ada8362be38f883e000000000000160014ab42a3e8c89d659b17c6c0e48b5524cafb2edfdb96330000000000001976a9141d2ee436ed6fcaf7f2c6b6a0873af0d572a4b22488ac763000000000000016001479e9f230b5af3a697fecd3d45f3446cf72455492c52b0000000000001600143dfa801118e6a344fc639407c7d5d905a581e420231c0000000000001976a9140f422ce0f3652905016388f3ff04a79e2965878f88ac1a150000000000001976a914288484d4eb8f48e0fc438aa163574a5982f1b2fa88ac1a15000000000000160014727556f2d472fcffae8c5419407d571eca6b972d6a100000000000001976a914284aaf4dc931a390600a9458906fb2d5112e8db588aca20f0000000000001976a9148544cea8843ec184fbe19622ec553984cfcf33f188ac08070000000000001600148220ae625139449ae22b08e9506df93f74bafd6cb004000000000000160014195e72d5f46872058b35034477cb2970b5d91d9d9cb32f00000000001976a91436e79d4e30d911b515aed7dc82db281fd944ff0d88ac0000000000000000036a01000000000000000000266a24aa21a9ed2d9f2f10eee6dfc72c822812c461e2e96fe128d42c0b3912ab12168605b60de5012000000000000000000000000000000000000000000000000000000000000000000000000001000000000102057b9164b7a7a905b25eb7a9beafca40c92c87497f1f68bb781d0ba2a1d3e397000000001716001486d31ff6e528ffdeea98b6ea02d47f1b9fccd235fdffffff7284b2a183ccd4dc87068cb8451f2617eaa33c5c9e87dcf6f4cbeb58ab77d3f209000000171600143012dff0a76e25c6799efb245588bbf53ff46c24fdffffff0108613c0000000000220020f9cd9d73beaca3aad488d521ac416e648e4e426ce0aa775077fc166405029f3002483045022100e452dbf670765bd38e0d1f9ab4a4db1c3c7a0124064a61d3bf9448eb4773ea0f02202b1fa1875f8ab2f8fda16bf0995f4e811693c042e8b3eec7e7caf7ca28d265900121029320a658125b8e628caa489aaaad4ba7672626a034eaf2deb6d15b3cfd8e8d8c0247304402205207b3bd3c60a17b8047c487dd7084c66b80262f83858075696e6950ba4abeb302202f8ae94b99471883d43a0f1078d72f859f0bd2a21600d60a7bd8311707b198b10121023e313436bf3ebfb55512879d867bb2ffc0d512ff6f3eb5f80bc2d84b3d4486e70000000002000000000101c34d149c3941ae0be5bc27349111aed993b64309312f28787ddab8b470f12fb20000000000fdffffff0131ef81000000000016001442069ff268f4a0cda683a959b9a4a000460da6050247304402204af94775024628332bd95af2e5ee6d6edf887869b408533ad349fe2391a1155102204f37a9a65f314581a1c4c2c4c0df59955d60c997be0e95c70e6bc6a4f546c7f80121026d688b056df5028fda3f6ef4f1401d690357a01a7c8709a5064ad3ec432472f500000000020000000001026ee08c8d1d426d88bc8b38527c0703e02b60e58e3f0d093175bf644d4dd342660100000017160014c33ce7855ea3e9c466007719ee46cceef1afa8b6ffffffff7ce2daf15c79635ed0114ee7c211c6ddf92b5bd810a12c3874eb8bfe99792d040000000017160014d47b4b6985796345a3c59f8d04d0ed5d2cad3bafffffffff01472e37000000000017a914fda8013970e817a10cb8c41e68f45ab4057000748702483045022100a4da02063d0c18a196562ef287a3fcf41f08aeb3fb3d19e4906aaad558b8f662022002f4c7eda74b5fe0d1085cef731bf73e277b19b7c8dc9cf5b9609d41d1822944012103b6100dbbc5021f76b8f348441f5ca686794bc7e15e6449b62fbb2b11bf81558502483045022100b83a18ea35007926042d95c2ed260f4ccad713432130ad9903fe668c8fc8780f0220497cf8ac8f6f5746457fa46f45f26a7acf2c9445cb4745b01385bdb0a7d92f6e012103570f0e90bf5b80fa8ab5f120d429a4e01106ed22e1b614d73e5f0f7da103134a000000000200000000010172e745f99617e6539601aa7b273aa0b9b054acae2e162c0b6f1cde15ad8ea08e00000000000000000002f1d30d00000000001976a91449600eb584b5dabe93453edeb3ca273ea5aadb5088ac791d21000000000016001431d7f41296fed86a840256e2d990693b8d17960f02483045022100ef95c97a4c1475930955e30f85e982228b2762b9312ada2aa671d7ba95dde09302200bd6422140532ddf9618c999c9590c7b1cb089c1dfa8882c643c7ae636e4ed5201210210b44e53eeb8906491f9d8f3bb455e9f82b4428f8cb5dd37e678a1db1a2994cd0000000002000000000103d32da5096870591e42d60b07833d1c07862aaf54b43d10eb43d7ff970e7bbb810000000000ffffffff09e5ba920c7d84b43686a14daaf6812bb5f67eb0ec0f81aa5adeb5d0a052c3760000000000fffffffffbf5a6c7ee32fcd973983fb4747de9d82cd3d8eb09fbbe532b6a444dccd0d69a0000000000ffffffff0200e20400000000001600143fd988d3d0050167f9fbc37136d4d4c26316a18bd80c000000000000160014650d5ca82fbc929677a07662a707e418868be2d502473044022070aef108e786dd9c83107a8fe0881cb7d1ae433c9c53f4b917c7b5e8138faa3102207299af4381656653edeaf4b72b6f8e5539746ce2d3d802bef93005f4a9c45a8d0121020abf91c56d0ba5a7eab4d59cfda6dcceaa28d02e6fda81e5dddc2292f5f149fc02483045022100c90bc838496f871718b0ee6eab6695f3ae6dd69fac782f7780af4064304d2650022047b5caca18e9c7eba76ed71547a241a3d73b9df77a593a1f588bbc7a01d19054012102b4c2ac895bfdc884d95b6952d4d486d978746efa6ccc7a277e34cad8cb43b385024730440220681adfd3a9fc2c46e1eb41670fd1678fe6e7636b7fa74487bc2d696a0ebfd973022062c2f47ab68dbd71015744dd2bd3790ef9d717cc57c4adfa461073f6dba98e2901210244dc0ff59da91529925a1c6f6a5aa9e0e117db094b22de031a41d26e82bf3ce400000000020000000001017f6566ada98c24e2b1ce0444137e97b9384c5958e9741f1767276e27c96512ca2400000000fdffffff01eb761200000000001976a914559425b02b6c3d6bc87721c5ab0c2d790740dc6688ac0246304302200c860c0da5c0a08dc412effe6d1e458df4a04516b1d07841602bc952c88b8d7a021f28afaff9c9c11971583fcc2420c5e67deebb437eafbb450bb0369ec0b281c8212103ad2904663c6d16bfc342ff74f475ff5ae7686e0824d94252c8d6fdbe6d8b061453f70e00020000000001016f46934d76fcdc3556dc80f7da3aaf6ebeeaa5ee9872f4aded38540025d428170000000000ffffffff02097416000000000016001441cc7b06c6d63a26a4ea4d246d77368bb44c8cd5801a060000000000160014d819f8b4438698acfac54f595e1505ccb781a0ff0247304402206c63c67bfb41056f8b5370a113c0efb79d5a557a51d0a928b1622ff9848cf2d20220773322b8fc36acceab49e040533bd5636bf77d36b0bdd55f17b2d576382e2f4201210379ad5090806d52568c64f6bdfec9e8437cc1a5597f274f9093f0acdd9a65115e000000000200000001c65c7c526cc83c2ebee9d0b31c7a2ae1647fdc8ae399007d0cff69d83e3897e6010000006a47304402205dd813f809e882c8e58febb41e56519fc50b32fb824d8f54af1a5a7bde42514702207c65c9b04df33c849b1ca7860eade0e69e07fdb8372e22fc2f05a9092bdd09fc2121021118dfa191749d41ca740b3a16055a39cdbfd1323a70bb9a07ab5577b2d6001cfdffffff0223e40100000000001600147f7b5ed211067afb811aa35311975263e64119be68065412000000001976a91415da7919444d5db05a92972c3e647d1a83e57fb288ac54f70e0002000000000101665ec6d9dd432bdeb29302f2d3ee98cb5895d4a086c83352aefdea0587574dab0100000000ffffffff01f02b00000000000017a914b78294f43e326b064b03295101bffc54ad2d351d870247304402201f9edcaad9fdd6591bfcf52d3ce93217dfede2b766c71341e21c0dcf99a15cd502203d997def7f673ea7391532b991fde0e385072da2a9a29ecfe7ab07c94a83b1640121025991497bfc3ab70216c218160a43b5726029ed1bb6d29b50daff604970ce7df200000000010000000001018c0594a86b5113a907d073d4fac7e9ad74805cdf12508b1ee3c0743d6c4c11c42300000000ffffffff17401f000000000000160014973a32d650db01a5414c8367275d622662cb24d18f8237000000000017a9147e234eb57da6f4d367ab27d07b6ce2e3c6dac44287592b000000000000160014e5102c2597a7a07cfd7d0664e3e6efe12ffc187c869f0c0000000000225120ffb28497a12ec9469ed2f6bb517525d2ee0a9b01e6728672381e101079e7cc3570050300000000001600148a8ac482a7722ff9ef6d467b406db5de71ae1ba142f6010000000000160014b94ed41f542ea80a85d8b934b5ccaed6319736305b051000000000001600148df3a673740282a5717a2014e7f76e60191140f0ee4b000000000000160014595b27112b0c5f2f3fb7f1c7b267312a7280e0332c4c0c000000000017a9140c3d1ced221d22d9532747cbd588279ef85024a08750ce130000000000160014163df1bd515dca6fdc2eb5d7dc7c54fc52f9d67f8453640000000000160014292454984417ab2c99edfb581f1ce02df47d74b96d5d1600000000001976a9143411605574239ff240843ea1582e787ff3a6d20c88acd001010000000000160014526c054c5d2e0234ee4699f3225de4ef3b35c620401f0000000000001976a914ee2697644b911aef096f826ec906d3cfc59f1dae88ac32a801000000000016001421a94efee6db2403bc5dffa2f98859b47e6611a9a4460000000000001600147763d4e4cce73d655b7bb7977e889a147b1c92493cdac1000000000016001448a3d1e414c2952acde5b96ae88aaf3b1f1d4bf28ba1010000000000225120d378df73597cdc7e693526af2149771f545ff7a7cdf508c1047bc68ac3506e20504600000000000016001401122eb711b0e44293b91b25f6214d9a7d2d804a7c96930000000000160014deefce9604f63277c8d36692e4454ec7ff4056cd8a140100000000001600140cb4f392eb5aa65fb289c065f68e8700bb59eaad1ef5000000000000220020333501cbc4116f2f70933a5bba45e80f34d785f5d9a3b84238de70263b3343ef8d78015b00000000160014b87d3a5297b5366f862113e35f4c5db9d1d13b3e02483045022100a97ef37c9f9eb9c794e7f969b385f772331e2d102dfa6c403ba13b60bf3b8a6702204c77923090d68e0bfba13ace1ae598ecdbdc365df53f8ca22d94fca809b4c9130121038fc22dfab2ba31f9309828d1b2d12c602d0ea50c4b8c0d5bcf18bbdacdf73e4a0000000002000000000101d10c6faa68fa96d506c7114a951decb747d1074754793ab5c146d9022d194b531000000000feffffff02e0d6c1000000000016001445f32fe97d871f56991461442ad506aa7848ffd20000000000000000346a3254524144452b3a74686f7231646b6579637836386564383975736c72336e7a7366786d356c7434336b64713238787839756a0247304402200c2e25daf9705858136a13a5c42401b846c2eae30e5fc7231f7dbcf243e3bf9902202f64d3df30a31c39df76329fdfd41d03d9e35751ef060791292e253a5317748901210219cef8a395defd264daa525043225635bcf312d4d4d62bc24dfca02c046ad91700000000010000000001013aa0e327f618bf7bafc79e311f26144f0b9300837ded80aded84492f6ca971cf0100000000ffffffff0244ac000000000000220020f1a51ce6efffa582db427ee0205d17c6ee771f865271ad8a090af28ed477ceb89f1e780100000000160014c246652eaba2f7d54d483b3c5584e612a6ed3938024730440220615ab5b3924e8a0dbbdd31320ebf2dcb9b8ae936b2d4ffcd2130df2163afba6c02202d5f2d8b6c998f198e9a767d98f852824a4514a71b95b120383e9a6bc67936bd012103cb848b85320d08b86af843ccd5268d89a34487192b8f066b541263526718833400000000020000000001012d4e6734aaa0ca518069f448820231fa117ad6c79d194be37090e27035ee7e100100000000fdffffff02180906000000000017a91482746d3811582e88e4b5c5cc0bfec650f9c4acb7870e1aa90000000000160014ccf11042b2eca8af658efc3978f00da55f29e53702473044022055a2887b5fd9729bbd36c6202ec10f2bd13890cff441bde6ca8cf008421d1c0002205c7ec8f8dd131cee63a5270d6a06440c8fe7bd78b621d332fef22daa67d16f6d0121036c74fa95984c7e17ca754ef2d17e5abe2c9d429bea66d7728bd57b09de77b4b70000000002000000000102cebf0fec7bb1dcfec72ec1e67794b8d274fca4bafabbbd4a4b77a0ab7ad457480000000000fdffffff7354f6eec004a8e4f8373bef87363c70c865fc3c616beceddc85a47b311e8edd0100000000fdffffff01131c00000000000016001491d4f6ef3d10720a06533977fb97f7743c8bc0ac0247304402200668e6228846b21b50c02d7ab9e864f492cb7f0de81928f1724690973f5e9ddb02204469ebce9038bd004156c62a0fff714a19f5f921530846b1a5a403e6e7bbfc84012103341d46143639e9ed927ac5198e03eaa1062e679f91a733e676a80a7abeba04a102473044022005e7f2e098a2dc753700bfbce4d07238bac00139408e97ba7c20fa91e3ad951d022074fe787c19c124a37162eae9a433f3baa9767862ea71a388df87571adc6d9cc201210375ecbb753c846e4c8a145817b69b37573a8c39399b8e57fb99b5f42309bb7f6912e00e0002000000000102c1ff05d04aaf4099c0eeaf7d1b7f6c6a186110d7264b1962ec41785eebd026ea1700000000fdffffffa413ca19ca42c7fee82659d69e716d7d9009cee25530ae0ea399e6db65ac6d4d0500000000fdffffff01144311000000000017a914e2d5886b994d01c5183cba5946a085a606b999e08702473044022056a5294ebe6fe09a9195224e3825d2024142306a2eedc3a59217b263160444520220290877d66cdac30f226f4b7fb8ce12ff3dce300590c236d74807801bb2b10ad6012103561d22c303c4aaa7839b0662b6b1c2a495fcee0f6591a22c5f496f404e4a23ef02483045022100ae0a8d10ee4cb1cf7a9dadbe998b35c2adbcba4d314ffb5905ae1433211043420220202d43144f3c98f66d3e3c499da28a5352f34e91982895873e1046cf0d1eabbd012102d920582d1bcb3fd50079286421e03b1a2fd1654482494467d6ec2b127e4daec60000000002000000000101468c0688650a4c9c3e1e5d6593adab856d4f118311725ddc3d5e758586233d8a0100000000fdffffff028608020000000000160014699fa75104c55309f6db4e0b5a656da48ec20cda180e0000000000001600143206f4cf21dafb3935679b957b4f6b52d29a33640247304402203438d56d19d471627108221326e0d5518039e0526f0c363e6e06e57f456b257902207895a845dff2abc8286429f3bdf4f0e6c998f4c4789562a4b2dfd6170959bb97012102a95c441bb3b5178b0e7db70d94b817b5f8b240911ebfc1d355f19d59fbccf2bb12e00e00

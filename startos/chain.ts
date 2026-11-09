@@ -17,4 +17,15 @@ export const chain = {
    */
   sslPort: 50022,
   tcpPort: 50021,
+  /**
+   * Look Back for Payments (the backfill): the chain split offered as a choice (null: none), and the
+   * rough cost per 1,000 blocks from the measurements in the frigate-companions project
+   * (internal_docs/SPIKES-S1-S4.md), for the action's description.
+   */
+  chainSplit: null as number | null,
+  backfillCost: {
+    trafficGb: '40 to 95',
+    full: '5 to 12 hours',
+    background: '1 to 2 days',
+  },
 } as const

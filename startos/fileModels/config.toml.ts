@@ -46,6 +46,12 @@ const shape = z.looseObject({
     .looseObject({
       startHeight: z.number().catch(taprootActivationHeight),
       cacheSize: z.string().catch('10M'),
+      // Look Back for Payments (patch 0008): absent means off
+      backfillFromHeight: z.number().optional().catch(undefined),
+      backfillSpeed: z
+        .union([z.literal('background'), z.literal('full')])
+        .optional()
+        .catch(undefined),
     })
     .catch({ startHeight: taprootActivationHeight, cacheSize: '10M' }),
   scan: z
