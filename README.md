@@ -78,7 +78,8 @@ One volume, `main`, mounted at `/root/.frigate`.
 | Path | What |
 |---|---|
 | `config.toml` | Frigate's configuration (see File Models) |
-| `store.json` | the selected node and indexer, and a pending Rebuild Index |
+| `store.json` | the selected node and indexer |
+| `rebuild.request` | present while a Rebuild Index is pending; `main` deletes `db/` and then this file at the next start |
 | `db/frigate.duckdb` | the Silent Payments tweak index; rebuildable, excluded from backup |
 | `db/start-height` | the first block the index covers, written by Frigate when the index starts |
 
@@ -91,7 +92,7 @@ The selected node's `main` volume is mounted read-only at `/root/.bitcoin` for i
   (the node's ZeroMQ port 28333; unused if the node has ZeroMQ off), `server.backendElectrumServer`
   and `limits.excludedSubnets` on every start, and `index.*`/`scan.*` from Configure Frigate.
   Other keys are kept.
-- **`store.json`**: `node`, `indexer`, `rebuildIndex`.
+- **`store.json`**: `node`, `indexer`.
 
 ## Dependencies
 
