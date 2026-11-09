@@ -60,6 +60,7 @@ image's entrypoint and Intel OpenCL runtime. See `Dockerfile`.
 | 0003 | serve the node's raw tip header (164 bytes on BLAKE2b); index a pruned node with `getblock` verbosity 3; mempool prevouts from `gettxout` (no `txindex`); start a new index at the node's prune height; stop with `FATAL` when a needed block has been pruned |
 | 0004 | Electrum protocol 1.8 on a chain with v2 headers (refuse lower, as Electrs Pruned does), `blake2b_fork` in `server.features`, and a check that the backend follows the same chain |
 | 0005 | stop with `FATAL` when the index belongs to another chain than the node's (a node switched across the SHA256/BLAKE2b split), instead of rolling back 10 blocks and mixing the two chains' tweaks |
+| 0006 | stop indexing at the next block on shutdown, so a stop or update during a long index is prompt (the next start resumes) |
 
 | Property | Value |
 |---|---|

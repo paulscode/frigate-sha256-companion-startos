@@ -1,0 +1,32 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Paul Lamb <paul@paulscode.com>
+Date: Mon, 9 Nov 2026 01:02:50 -0600
+Subject: [PATCH 6/6] Stop indexing promptly on shutdown
+
+The block indexing loop ran to the end of its range whatever happened,
+and shutdown closes the index, which waits for it. During a first index
+or a long catch-up that is minutes to hours, so a service manager asking
+Frigate to stop (an update, a restart) gave up and killed it. The loop
+now checks the stop flag before each block and ends after the block in
+hand; the next start resumes from the last block indexed.
+---
+ .../com/sparrowwallet/frigate/bitcoind/BitcoindClient.java  | 6 ++++++
+ 1 file changed, 6 insertions(+)
+
+diff --git a/src/main/java/com/sparrowwallet/frigate/bitcoind/BitcoindClient.java b/src/main/java/com/sparrowwallet/frigate/bitcoind/BitcoindClient.java
+index b9fae88..2f03ecd 100644
+--- a/src/main/java/com/sparrowwallet/frigate/bitcoind/BitcoindClient.java
++++ b/src/main/java/com/sparrowwallet/frigate/bitcoind/BitcoindClient.java
+@@ -378,6 +378,12 @@ public class BitcoindClient {
+         long lastLogTime = System.currentTimeMillis();
+ 
+         for(int i = startHeight; i <= maxHeight; i++) {
++            //a stop during a long index (the first one, or a catch-up) ends it after the block in hand, rather than when the whole run
++            //is done: shutdown closes the index, which waits for this loop, and a service manager gives up waiting long before that
++            if(stopped) {
++                log.info("Stopping indexing at block {}", i);
++                return;
++            }
+             try {
+                 if(useGetBlockVerbose) {
+                     indexBlockVerbose(i, hexFormat);
