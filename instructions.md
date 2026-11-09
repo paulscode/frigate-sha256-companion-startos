@@ -37,7 +37,7 @@ Changing the start height rebuilds the index.
 
 On a pruned node, **Configure Frigate** can also **Look Back for Payments** below where the index starts:
 
-- **Back to the BLAKE2b chain split** (block 961640): every block since the BLAKE2b chain split from the SHA256 chain. On the SHA256 chain it is just a block.
+- **Back to the BLAKE2b chain split** (block 961640): every block since the BLAKE2b chain split from the SHA256 chain. On the SHA256 chain this is simply block 961640, with no special meaning.
 - **Back to Taproot activation** (block 709632): every block where a Silent Payment is possible. On a pruned node this is a very large download; see below.
 - **Back to the block below**: a block you enter in **Look Back to Block**, such as your wallet's birthday.
 
@@ -63,5 +63,5 @@ Frigate can scan far faster on a GPU. **Compute Backend** in **Configure Frigate
 ## Limitations
 
 - Frigate is experimental, and so is wallet support for Silent Payments. Treat it as something to try rather than something to depend on.
-- On a pruned node, payments in blocks the node has discarded are not found.
+- On a pruned node, payments in blocks the node has discarded are found only with **Look Back for Payments**, at its cost.
 - If the node has ZeroMQ turned off, Frigate checks for new mempool transactions every 5 seconds instead of at once. Nothing else changes.

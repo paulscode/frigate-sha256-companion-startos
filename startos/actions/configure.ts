@@ -1,5 +1,6 @@
 import { config, isCacheSize } from '../fileModels/config.toml'
 import { writeFile } from 'fs/promises'
+import { existsSync } from 'fs'
 import { i18n } from '../i18n'
 import { sdk } from '../sdk'
 import {
@@ -53,7 +54,7 @@ const inputSpec = InputSpec.of({
   rebuildIndex: Value.toggle({
     name: i18n('Rebuild Index'),
     description: i18n(
-      "Delete the Silent Payments index and build it again on the next start, from the start height above (or the node's prune height on a pruned node). Use it after the node pruned blocks this index still needed, or to start from a different height. Wallets connected meanwhile see only what has been indexed so far. If Look Back for Payments is on, the new index looks back again, at the same cost as the first time.",
+      "Delete the Silent Payments index and build it again on the next start, from the start height above (or a few blocks above the node's prune height on a pruned node). Use it after the node pruned blocks this index still needed, or to start from a different height. Wallets connected meanwhile see only what has been indexed so far. If Look Back for Payments is on, the new index looks back again, at the same cost as the first time.",
     ),
     default: false,
   }),
@@ -68,7 +69,7 @@ const inputSpec = InputSpec.of({
   lookBackHeight: Value.number({
     name: i18n('Look Back to Block'),
     description: i18n(
-      "Used when Look Back for Payments is set to the block below: for example your wallet's birthday, or the block of its first payment.",
+      "Used when Look Back for Payments is set to the block below: for example your wallet's birthday, or the block of its first payment. A block at or above where the index already starts adds nothing.",
     ),
     required: false,
     integer: true,
@@ -139,7 +140,8 @@ export const configure = sdk.Action.withInput(
       const what = i18n(
         'Index start height, rebuilding the index, looking back for older payments, and scanning performance.',
       )
-      return start
+      // not while a rebuild is pending: that index is about to go
+      return start && !existsSync(rebuildRequest)
         ? `${what} ${i18n('This index starts at block ${start}.', { start })}`
         : what
     })(),

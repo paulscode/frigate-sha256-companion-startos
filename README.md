@@ -57,7 +57,7 @@ image's entrypoint and Intel OpenCL runtime. See `Dockerfile`.
 |---|---|
 | 0001 | upstream (post-1.6.1): retry block fetches when the node connection drops |
 | 0002 | upstream (post-1.6.1): notifications without an id |
-| 0003 | serve the node's raw tip header (164 bytes on BLAKE2b); index a pruned node with `getblock` verbosity 3; mempool prevouts from `gettxout` (no `txindex`); start a new index at the node's prune height; stop with `FATAL` when a needed block has been pruned |
+| 0003 | serve the node's raw tip header (164 bytes on BLAKE2b); index a pruned node with `getblock` verbosity 3; mempool prevouts from `gettxout` (no `txindex`); start a new index at the node's prune height plus 6 blocks; stop with `FATAL` when a needed block has been pruned |
 | 0004 | Electrum protocol 1.8 on a chain with v2 headers (refuse lower, as Electrs Pruned does), `blake2b_fork` in `server.features`, and a check that the backend follows the same chain |
 | 0005 | stop with `FATAL` when the index belongs to another chain than the node's (a node switched across the SHA256/BLAKE2b split), instead of rolling back 10 blocks and mixing the two chains' tweaks |
 | 0006 | stop indexing at the next block on shutdown, so a stop or update during a long index is prompt (the next start resumes) |
@@ -84,7 +84,7 @@ One volume, `main`, mounted at `/root/.frigate`.
 |---|---|
 | `config.toml` | Frigate's configuration (see File Models) |
 | `store.json` | the selected node and indexer |
-| `rebuild.request` | present while a Rebuild Index is pending; `main` deletes `db/` and then this file at the next start |
+| `rebuild.request` | present while a Rebuild Index is pending; `main` deletes `db/` and `recentblocks`, then this file, at the next start |
 | `db/frigate.duckdb` | the Silent Payments tweak index; rebuildable, excluded from backup |
 | `db/start-height` | the first block the index covers, written by Frigate when the index starts |
 
@@ -119,8 +119,8 @@ dependency enabled only while selected. **No autoconfig task** is raised on the 
 | Fulcrum (archival node, txindex) | `fulcrum` | `primary`, `sync-progress` | `>=2.1.1:8`, or privkeyio's `#blake:2.1.4:0` |
 
 The indexer must follow the same chain as the node. Frigate checks this itself (patch 0004) by
-comparing a recent header from each, at start and every ten minutes, and refuses wallets while they
-differ.
+comparing a recent header from each, at start and every ten minutes (every minute while they differ),
+and refuses wallets while they differ.
 
 ## Network Access and Interfaces
 
@@ -166,7 +166,7 @@ above). Nothing is ever asked of the node.
 
 ## Backups and Restore
 
-The volume is backed up except `db/` (the index), `frigate.log`, `recentblocks` and a pending `rebuild.request`. A restore rebuilds the index, and with Look Back for Payments on, the new index looks back again.
+The volume is backed up except `db/` (the index), `frigate.log` and its rolled copies, `recentblocks` and a pending `rebuild.request`. A restore rebuilds the index, and with Look Back for Payments on, the new index looks back again.
 
 ## Limitations and Differences
 
@@ -200,7 +200,7 @@ dependencies:
   indexer: one of electrs-pruned | fulcrum-pruned | electrs | fulcrum (Select Indexer)
 actions: [select-node, select-indexer, config]
 health_checks: [primary, sync-progress, indexer]
-backup_excludes: [/db, /frigate.log, /recentblocks, /rebuild.request]
+backup_excludes: [/db, /frigate.log, /frigate.1.log, /frigate.2.log, /frigate.3.log, /recentblocks, /rebuild.request]
 logs_to_watch:
   - "Silent Payments index starts at block N"
   - "Backend chain check: ..." / "Backend chain check FAILED: ..."

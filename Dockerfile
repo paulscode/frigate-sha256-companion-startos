@@ -63,8 +63,10 @@ RUN grep --quiet --fixed-strings "'--strip-native-commands'" build.gradle \
     && sed --in-place -E "s/'--strip-native-commands',? ?//" build.gradle \
     && ! grep --quiet --fixed-strings "'--strip-native-commands'" build.gradle
 # The libraries, from Maven Central and the Gradle plugin portal, fetched before the build and retried
-# like the Gradle zip: a failed download is then a retry, not a failed release.
-RUN for i in $(seq 1 6); do ./gradlew --no-daemon dependencies :drongo:dependencies >/dev/null && exit 0; echo "dependency download failed, retrying"; sleep 30; done; exit 1
+# like the Gradle zip: a failed download is then a retry, not a failed release. Compiling (main and
+# tests) resolves and downloads every jar the build needs and fails if one is missing, which the
+# `dependencies` report does not. (A compile error retries too, then fails the same way.)
+RUN for i in $(seq 1 6); do ./gradlew --no-daemon testClasses :drongo:testClasses >/dev/null && exit 0; echo "dependency download failed, retrying"; sleep 30; done; exit 1
 # The tests run on the native build only (the build machine's own architecture): under emulation they
 # would take hours, and the code is the same on both. A build with no native leg says so loudly.
 ARG BUILDPLATFORM

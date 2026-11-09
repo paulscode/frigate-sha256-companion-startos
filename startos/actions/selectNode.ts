@@ -14,7 +14,7 @@ export const selectNode = sdk.Action.withInput(
       'Choose which installed Bitcoin node Frigate reads blocks and the mempool from.',
     ),
     warning: i18n(
-      'The node decides which chain this server serves. Select an indexer that follows the same node: Frigate refuses wallets while the two are on different chains. Switching to a node on another chain needs Rebuild Index under Configure Frigate.',
+      'The node decides which chain this server serves. Select an indexer that follows the same node: Frigate refuses wallets while the two are on different chains. Switching to a node on another chain needs Rebuild Index under Configure Frigate, and with Look Back for Payments on, the new index looks back again, at the same cost.',
     ),
     allowedStatuses: 'any',
     group: null,

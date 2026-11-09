@@ -10,36 +10,38 @@ Subject: [PATCH 10/10] Hardening from an adversarial review
 - a config.toml that cannot be read stops Frigate with the reason, instead of
   running on defaults against another node and no backend
 - the wait for a node behind the index gives up when the node stops advancing
-- the fork point search is serialized, a failure remembered per tip, and a
-  backend's blake2b_fork passed on only if the node has that block there
-- the backend chain check uses the configured TLS, and rechecks every minute
-  while it reports another chain
+- the fork point search has its own lock, its answer (found or not) is kept per
+  tip, and a backend's blake2b_fork is passed on only if the node has that block
+- the backend chain check uses the configured TLS, rechecks every minute while
+  it reports another chain, and logs a good result again after one that could
+  not run
+- poll errors carry their reason; an index write failure is logged as such
 - backfill: cancelled lookups end; wallets rescanned every 10 minutes, not
-  every minute; the getblockfrompeer path waits while the node is half again
-  over its prune target
+  every minute; the getblockfrompeer path waits while the node is more than
+  4 GB over where it was (or half again its prune target)
 - a wallet scanning from below the index's first block is noted in the log
 - frigate.log rolls at 10 MB, three old files kept
 ---
- .../frigate/bitcoind/Backfill.java            | 31 +++++++-
- .../frigate/bitcoind/BitcoindClient.java      | 24 ++++++-
+ .../frigate/bitcoind/Backfill.java            | 45 +++++++++++-
+ .../frigate/bitcoind/BitcoindClient.java      | 41 ++++++++++-
  .../bitcoind/BitcoindClientService.java       |  3 +
- .../frigate/electrum/BackendChainCheck.java   |  6 +-
+ .../frigate/electrum/BackendChainCheck.java   | 14 +++-
  .../electrum/ElectrumServerService.java       | 19 +++++
- .../sparrowwallet/frigate/index/Index.java    | 11 ++-
+ .../sparrowwallet/frigate/index/Index.java    | 15 +++-
  .../frigate/index/IndexQuerier.java           | 11 +++
  .../com/sparrowwallet/frigate/io/Config.java  |  3 +-
  .../frigate/io/RecentBlocksMap.java           | 13 ++--
  .../com/sparrowwallet/frigate/io/Storage.java | 23 ++++++
  src/main/resources/logback.xml                | 12 +++-
  .../frigate/io/DurableFilesTest.java          | 72 +++++++++++++++++++
- 12 files changed, 212 insertions(+), 16 deletions(-)
+ 12 files changed, 252 insertions(+), 19 deletions(-)
  create mode 100644 src/test/java/com/sparrowwallet/frigate/io/DurableFilesTest.java
 
 diff --git a/src/main/java/com/sparrowwallet/frigate/bitcoind/Backfill.java b/src/main/java/com/sparrowwallet/frigate/bitcoind/Backfill.java
-index 7284c73..758210f 100644
+index 7284c73..a493ce1 100644
 --- a/src/main/java/com/sparrowwallet/frigate/bitcoind/Backfill.java
 +++ b/src/main/java/com/sparrowwallet/frigate/bitcoind/Backfill.java
-@@ -48,7 +48,9 @@ public class Backfill {
+@@ -48,7 +48,11 @@ public class Backfill {
      static final long RETRY_INITIAL_MILLIS = 5_000;
      static final long RETRY_MAX_MILLIS = 600_000;
      static final long PEER_WAIT_MILLIS = 30_000;
@@ -47,10 +49,12 @@ index 7284c73..758210f 100644
 +    //each notice queues a scan per subscribed wallet, so not too often: a payment found reaches wallets within this
 +    static final long NOTIFY_INTERVAL_MILLIS = 10 * 60_000;
 +    static final long NODE_DISK_WAIT_MILLIS = 60_000;
++    static final long NODE_DISK_ALLOWANCE = 4_000_000_000L;
++    private volatile long nodeSizeAtStart = -1;
      static final long PROGRESS_LOG_MILLIS = 30_000;
      static final long CHAIN_CHECK_WAIT_MILLIS = 60_000;
      static final long BACKEND_REQUEST_TIMEOUT_MILLIS = 180_000;
-@@ -372,6 +374,7 @@ public class Backfill {
+@@ -372,6 +376,7 @@ public class Backfill {
       * until it next prunes, as it would a new one; it adds no undo data.
       */
      private Block fetchBlockFromPeer(BitcoindClientService service, String blockHash) {
@@ -58,7 +62,7 @@ index 7284c73..758210f 100644
          List<PeerInfo> peers = new ArrayList<>(service.getPeerInfo().stream().filter(PeerInfo::servesHistoricalBlocks).toList());
          if(peers.isEmpty()) {
              throw new IllegalStateException("the node has no peer that serves old blocks, to fetch pruned block " + blockHash + " from");
-@@ -410,6 +413,29 @@ public class Backfill {
+@@ -410,6 +415,38 @@ public class Backfill {
          throw new IllegalStateException("no peer sent pruned block " + blockHash);
      }
  
@@ -73,12 +77,21 @@ index 7284c73..758210f 100644
 +            Map<String, Object> info = service.getBlockchainInfoMap();
 +            Object size = info.get("size_on_disk");
 +            Object target = info.get("prune_target_size");
-+            if(!(size instanceof Number s) || !(target instanceof Number t) || t.longValue() <= 0 || s.longValue() <= t.longValue() * 3 / 2) {
++            if(!(size instanceof Number s) || !(target instanceof Number t) || t.longValue() <= 0) {
++                return;
++            }
++            //a node runs somewhat over its target anyway (the last 288 blocks are always kept), so allow what it held when the
++            //backfill began, or half again its target, whichever is more, plus NODE_DISK_ALLOWANCE for fetched blocks
++            if(nodeSizeAtStart < 0) {
++                nodeSizeAtStart = s.longValue();
++            }
++            long limit = Math.max(nodeSizeAtStart, t.longValue() * 3 / 2) + NODE_DISK_ALLOWANCE;
++            if(s.longValue() <= limit) {
 +                return;
 +            }
 +            if(!logged) {
-+                log.warn("Backfill waiting: the node holds {} MB, over its prune target of {} MB, with blocks fetched for the backfill; waiting for it to prune",
-+                        s.longValue() / 1_000_000, t.longValue() / 1_000_000);
++                log.warn("Backfill waiting: the node holds {} MB, {} MB over its prune target of {} MB with blocks fetched for the backfill; waiting for it to prune them (up to about 2 days)",
++                        s.longValue() / 1_000_000, (s.longValue() - t.longValue()) / 1_000_000, t.longValue() / 1_000_000);
 +                logged = true;
 +            }
 +            sleep(NODE_DISK_WAIT_MILLIS);
@@ -88,7 +101,7 @@ index 7284c73..758210f 100644
      /**
       * Checks a block fetched from peers against the node's header: the header must hash to the block asked for, and the transactions
       * must be the ones it commits to, txids through the Merkle root and witness data through the coinbase's witness commitment (BIP141).
-@@ -613,6 +639,9 @@ public class Backfill {
+@@ -613,6 +650,9 @@ public class Backfill {
      private Transaction lookUpTransaction(Sha256Hash txid) throws InterruptedException {
          long delay = RETRY_INITIAL_MILLIS;
          for(int attempt = 1; !stopped; attempt++) {
@@ -98,8 +111,18 @@ index 7284c73..758210f 100644
              BackendConnection connection = connections.poll(1, TimeUnit.SECONDS);
              if(connection == null) {
                  continue;
+@@ -640,7 +680,8 @@ public class Backfill {
+             } finally {
+                 connections.add(connection);
+             }
+-            sleep(delay);
++            //interruptible, unlike sleep(): a cancelled lookup ends here (a stop also shuts the pool down, which interrupts)
++            Thread.sleep(delay);
+             delay = Math.min(delay * 2, RETRY_MAX_MILLIS);
+         }
+         return null;
 diff --git a/src/main/java/com/sparrowwallet/frigate/bitcoind/BitcoindClient.java b/src/main/java/com/sparrowwallet/frigate/bitcoind/BitcoindClient.java
-index 5bcf15b..f0b3b65 100644
+index 5bcf15b..cb20c4e 100644
 --- a/src/main/java/com/sparrowwallet/frigate/bitcoind/BitcoindClient.java
 +++ b/src/main/java/com/sparrowwallet/frigate/bitcoind/BitcoindClient.java
 @@ -47,6 +47,7 @@ public class BitcoindClient {
@@ -135,16 +158,31 @@ index 5bcf15b..f0b3b65 100644
              try {
                  Thread.sleep(10_000);
              } catch(InterruptedException e) {
-@@ -378,7 +395,7 @@ public class BitcoindClient {
-      *
+@@ -379,12 +396,22 @@ public class BitcoindClient {
       * @return the fork point, or null if the chain has no v2 header
       */
--    public ServerFeatures.Blake2bFork getBlake2bForkPoint() {
-+    public synchronized ServerFeatures.Blake2bFork getBlake2bForkPoint() {
+     public ServerFeatures.Blake2bFork getBlake2bForkPoint() {
++        //its own lock: not this client's, which block and mempool indexing hold for as long as they run
++        synchronized(forkPointLock) {
++            return findBlake2bForkPoint();
++        }
++    }
++
++    private final Object forkPointLock = new Object();
++
++    private ServerFeatures.Blake2bFork findBlake2bForkPoint() {
          ElectrumBlockHeader current = tip;
          if(current == null || !current.isV2()) {
              return null;
-@@ -410,6 +427,9 @@ public class BitcoindClient {
+         }
+         ServerFeatures.Blake2bFork cached = forkPoint;
+-        if(cached != null && current.hex().equals(forkPointTip)) {
++        //answered for this tip already, found or not
++        if(current.hex().equals(forkPointTip)) {
+             return cached;
+         }
+         try {
+@@ -410,6 +437,9 @@ public class BitcoindClient {
              return found;
          } catch(RuntimeException e) {
              log.warn("Could not find the BLAKE2b fork point", e);
@@ -154,6 +192,20 @@ index 5bcf15b..f0b3b65 100644
              return null;
          }
      }
+@@ -1080,7 +1110,12 @@ public class BitcoindClient {
+                 System.exit(3);
+             } catch(Exception e) {
+                 lastPollException = e;
+-                log.warn("Error polling Bitcoin Core", e);
++                if(e.getMessage() != null && e.getMessage().startsWith("Could not add block")) {
++                    log.warn("Error writing the index (it is retried at the next poll): " + e.getMessage(), e);
++                } else {
++                    //the reason on the line itself, for packages that show it
++                    log.warn("Error polling Bitcoin Core: " + (e.getCause() != null && e.getCause().getMessage() != null ? e.getCause().getMessage() : e.getMessage()), e);
++                }
+ 
+                 if(syncing) {
+                     syncingLock.lock();
 diff --git a/src/main/java/com/sparrowwallet/frigate/bitcoind/BitcoindClientService.java b/src/main/java/com/sparrowwallet/frigate/bitcoind/BitcoindClientService.java
 index 35a2897..35d00fd 100644
 --- a/src/main/java/com/sparrowwallet/frigate/bitcoind/BitcoindClientService.java
@@ -169,7 +221,7 @@ index 35a2897..35d00fd 100644
      String getBlockHash(@JsonRpcParam("height") int height);
  
 diff --git a/src/main/java/com/sparrowwallet/frigate/electrum/BackendChainCheck.java b/src/main/java/com/sparrowwallet/frigate/electrum/BackendChainCheck.java
-index 5aee7b0..5bbadd8 100644
+index 5aee7b0..fd22af2 100644
 --- a/src/main/java/com/sparrowwallet/frigate/electrum/BackendChainCheck.java
 +++ b/src/main/java/com/sparrowwallet/frigate/electrum/BackendChainCheck.java
 @@ -56,7 +56,8 @@ public final class BackendChainCheck {
@@ -182,7 +234,27 @@ index 5aee7b0..5bbadd8 100644
                  } catch(InterruptedException e) {
                      return;
                  }
-@@ -89,7 +90,8 @@ public final class BackendChainCheck {
+@@ -73,12 +74,18 @@ public final class BackendChainCheck {
+ 
+     record Result(State state, String detail) {}
+ 
++    //whether the last check could not run: the next one that finds the same chain is then logged again, so a package that showed
++    //the backend as unreachable sees that it is back
++    private static volatile boolean lastUnknown;
++
+     private static void record(Result result) {
+         State previous = state;
++        boolean wasUnknown = lastUnknown;
++        lastUnknown = result.state() == State.UNKNOWN;
+         state = result.state() == State.UNKNOWN && previous != State.UNKNOWN ? previous : result.state();
+         switch(result.state()) {
+             case SAME -> {
+-                if(previous != State.SAME) {
++                if(previous != State.SAME || wasUnknown) {
+                     log.info("Backend chain check: the Electrum backend follows the node's chain (" + result.detail() + ")");
+                 }
+             }
+@@ -89,7 +96,8 @@ public final class BackendChainCheck {
      }
  
      static Result checkOnce(BitcoindClient bitcoindClient, Server backend) {
@@ -244,19 +316,23 @@ index ff1157d..0e66ba6 100644
  
          requestHandler.runAfterResponse(() -> {
 diff --git a/src/main/java/com/sparrowwallet/frigate/index/Index.java b/src/main/java/com/sparrowwallet/frigate/index/Index.java
-index 531b4ff..4a62e7e 100644
+index 531b4ff..993dccf 100644
 --- a/src/main/java/com/sparrowwallet/frigate/index/Index.java
 +++ b/src/main/java/com/sparrowwallet/frigate/index/Index.java
-@@ -248,7 +248,7 @@ public class Index {
+@@ -248,7 +248,11 @@ public class Index {
          File file = new File(Storage.getFrigateDbDir(), START_HEIGHT_FILENAME);
          try {
              if(!hasIndexedBlocks()) {
 -                Files.writeString(file.toPath(), nextHeight + "\n");
-+                writeStartHeight(nextHeight);
++                try {
++                    writeStartHeight(nextHeight);
++                } catch(IllegalStateException e) {
++                    log.warn("Could not record where this index starts", e);
++                }
                  return nextHeight;
              }
              return file.exists() ? Integer.parseInt(Files.readString(file.toPath()).trim()) : -1;
-@@ -350,6 +350,12 @@ public class Index {
+@@ -350,6 +354,12 @@ public class Index {
              }
          } catch(Exception e) {
              log.error("Error adding to index", e);
@@ -269,7 +345,7 @@ index 531b4ff..4a62e7e 100644
          }
      }
  
-@@ -526,8 +532,7 @@ public class Index {
+@@ -526,8 +536,7 @@ public class Index {
          File file = new File(Storage.getFrigateDbDir(), START_HEIGHT_FILENAME);
          File tmp = new File(Storage.getFrigateDbDir(), START_HEIGHT_FILENAME + ".tmp");
          try {

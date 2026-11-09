@@ -192,10 +192,16 @@ export const main = sdk.setupMain(async ({ effects }) => {
     }
     if (bfStart || /Backfill complete/.test(line)) backfillNote = null
     const err = / ERROR (.+)/.exec(line)
-    if (err && !line.includes('FATAL: ') && !line.includes('Backfill')) {
+    if (err && !/FATAL: |Backfill|Backend chain check/.test(line)) {
       lastError = err[1].trim().slice(0, 300)
     }
-    if (line.includes('Electrum server listening')) lastError = null
+    // cleared once Frigate is plainly running again: listening, or indexing on
+    if (
+      /Electrum server listening|Indexing progress: |Indexing \d+ blocks|Block index is up to date/.test(
+        line,
+      )
+    )
+      lastError = null
     if (line.includes('Error polling Bitcoin Core')) {
       const now = Date.now()
       if (pollErrorSince === null || now - pollErrorAt > 60_000)
@@ -270,23 +276,24 @@ export const main = sdk.setupMain(async ({ effects }) => {
               '-c',
               // Frigate stops at once without the node's cookie, so wait for it (the node starting,
               // or not yet installed), then run the image's own entrypoint, passing a stop on to it.
-              // frigate.log is Frigate's own unrotated copy of what StartOS already captures: cap it.
-              `f=/root/.frigate/frigate.log
-[ -f "$f" ] && [ "$(wc -c < "$f")" -gt 52428800 ] && : > "$f"
-for i in $(seq 1 300); do
+              `for i in $(seq 1 300); do
   [ -r /root/.bitcoin/.cookie ] && break
   [ "$i" = 1 ] && echo "Waiting for the node's RPC cookie"
   sleep 1
 done
-# The trap first, so a stop that arrives as Frigate starts still reaches it
-pid=""; term=""
-# (or, with Frigate not running, as in the hold below, ends this at once)
-trap 'term=1; if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then kill -TERM "$pid"; else exit 0; fi' TERM INT
+# The trap first: a stop while Frigate runs is passed on to it; one that arrives while it is being
+# started is passed on once its pid is known; and one with Frigate not running (the hold below) ends
+# this at once.
+pid=""; term=""; launching=""
+trap 'term=1; if [ -n "$pid" ]; then kill -TERM "$pid" 2>/dev/null; elif [ -z "$launching" ]; then exit 0; fi' TERM INT
+launching=1
 /usr/local/bin/docker-entrypoint.sh &
 pid=$!
+launching=""
 [ -n "$term" ] && kill -TERM "$pid" 2>/dev/null
 # wait returns early when a trapped signal arrives: wait again for Frigate itself to finish
 while :; do wait "$pid"; rc=$?; kill -0 "$pid" 2>/dev/null || break; done
+pid=""
 [ -n "$term" ] && exit 0
 # 3: a stop that restarting cannot fix (a block the index needs was pruned, or the index belongs to
 # another chain). Hold here rather than restart into the same stop every 30 seconds, so the FATAL
