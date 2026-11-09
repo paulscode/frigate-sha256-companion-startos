@@ -29,6 +29,8 @@ Frigate finds Silent Payments made at or after the block its index starts from. 
 - **On a pruned node** the index starts at the oldest block the node still holds, because the node has discarded what Frigate needs for older blocks. A larger prune target on the node keeps more blocks and so reaches further back: the node keeps as many recent blocks as fit in its prune target.
 - **On an archival node** it starts at Taproot activation (block 709632), where Silent Payments became possible, unless you set a later block in **Configure Frigate**. A later start makes the first index faster.
 
+Once indexed, a block stays in Frigate's index: pruning on the node later only limits where a *new* index can start. So on a pruned node, install Frigate early. On the BLAKE2b chain, a node that still holds the first BLAKE2b block (961640) gives an index that covers the whole BLAKE2b chain and keeps it.
+
 Changing the start height rebuilds the index.
 
 If Frigate is stopped for long enough that the node discards blocks the index still needs, Frigate stops and says so rather than skip them. Run **Configure Frigate** with **Rebuild Index** on, and it starts a new index from the node's current oldest block.
