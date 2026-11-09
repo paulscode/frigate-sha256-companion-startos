@@ -40,6 +40,9 @@ RUN set -e; ls /tmp/patches/*.patch >/dev/null; \
 # The launcher script runs bin/java, which jlink's --strip-native-commands would leave out.
 RUN grep --quiet --fixed-strings "'--strip-native-commands'" build.gradle \
     && sed --in-place "s/'--strip-native-commands', //" build.gradle
+# Gradle itself, fetched first and retried: GitHub's release downloads fail now and then (504), and
+# that should not fail a release build.
+RUN for i in 1 2 3 4 5; do ./gradlew --no-daemon --version >/dev/null && exit 0; echo "gradle download failed, retrying"; sleep 20; done; exit 1
 # The tests run on the native build only: under emulation they would take hours, and the code is the
 # same on both architectures.
 RUN if [ "$(uname -m)" = x86_64 ]; then ./gradlew --no-daemon clean test jlink; else ./gradlew --no-daemon clean jlink; fi
