@@ -1,8 +1,8 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Paul Lamb <paul@paulscode.com>
 Date: Mon, 9 Nov 2026 01:23:34 -0600
-Subject: [PATCH 7/9] Look up confirmed transactions through the backend; fixes
- from review
+Subject: [PATCH 07/10] Look up confirmed transactions through the backend;
+ fixes from review
 
 blockchain.transaction.get asked only the node: its wallet, then
 getrawtransaction, which finds a confirmed transaction only with

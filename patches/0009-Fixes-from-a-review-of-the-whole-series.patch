@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Paul Lamb <paul@paulscode.com>
 Date: Mon, 9 Nov 2026 10:11:24 -0600
-Subject: [PATCH 9/9] Fixes from a review of the whole series
+Subject: [PATCH 09/10] Fixes from a review of the whole series
 
 - clear recentblocks for an index with nothing indexed, so hashes left from a
   deleted index cannot hide a reorg at the new tip

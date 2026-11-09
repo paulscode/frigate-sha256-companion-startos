@@ -1,7 +1,8 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Paul Lamb <paul@paulscode.com>
 Date: Sun, 8 Nov 2026 23:26:55 -0600
-Subject: [PATCH 3/9] Serve the node's own tip header, and index a pruned node
+Subject: [PATCH 03/10] Serve the node's own tip header, and index a pruned
+ node
 
 Two changes that let Frigate run where it could not before, neither tied
 to one chain.

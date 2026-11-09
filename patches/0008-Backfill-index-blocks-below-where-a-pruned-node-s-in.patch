@@ -1,8 +1,8 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Paul Lamb <paul@paulscode.com>
 Date: Mon, 9 Nov 2026 08:18:03 -0600
-Subject: [PATCH 8/9] Backfill: index blocks below where a pruned node's index
- starts
+Subject: [PATCH 08/10] Backfill: index blocks below where a pruned node's
+ index starts
 
 Opt-in (index.backfillFromHeight, index.backfillSpeed): from the chosen block up
 to the index's first block, oldest first, after the index has caught up with the

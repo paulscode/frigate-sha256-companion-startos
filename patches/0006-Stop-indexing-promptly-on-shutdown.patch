@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Paul Lamb <paul@paulscode.com>
 Date: Mon, 9 Nov 2026 01:02:50 -0600
-Subject: [PATCH 6/9] Stop indexing promptly on shutdown
+Subject: [PATCH 06/10] Stop indexing promptly on shutdown
 
 The block indexing loop ran to the end of its range whatever happened,
 and shutdown closes the index, which waits for it. During a first index

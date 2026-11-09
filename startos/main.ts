@@ -129,6 +129,14 @@ export const main = sdk.setupMain(async ({ effects }) => {
   let fatal: string | null = null
   let backendCheck: 'unknown' | 'same' | 'different' = 'unknown'
   let waitingForCookie = false
+  // how many times Frigate has been started, and the last error it logged: a crash loop without FATAL
+  // (an unreadable config, the node refusing the credentials) would otherwise say "starting" forever
+  let starts = 0
+  let lastError: string | null = null
+  // the node unreachable while Frigate runs: Frigate keeps serving the tip it has and logs every poll
+  let pollErrorSince: number | null = null
+  let pollErrorAt = 0
+  let pollError: string | null = null
   // A look back that cannot run (before it has a block to look back to) or stopped on an error
   let backfillNote: string | null = null
   // Look Back for Payments (the backfill), which runs once the index has caught up with the tip
@@ -183,6 +191,25 @@ export const main = sdk.setupMain(async ({ effects }) => {
       backfillWaiting = null
     }
     if (bfStart || /Backfill complete/.test(line)) backfillNote = null
+    const err = / ERROR (.+)/.exec(line)
+    if (err && !line.includes('FATAL: ') && !line.includes('Backfill')) {
+      lastError = err[1].trim().slice(0, 300)
+    }
+    if (line.includes('Electrum server listening')) lastError = null
+    if (line.includes('Error polling Bitcoin Core')) {
+      const now = Date.now()
+      if (pollErrorSince === null || now - pollErrorAt > 60_000)
+        pollErrorSince = now
+      pollErrorAt = now
+      pollError =
+        line.replace(/.*Error polling Bitcoin Core:? ?/, '').slice(0, 200) ||
+        null
+    }
+    const couldNot = /Backend chain check could not run: (.+)/.exec(line)
+    if (couldNot) {
+      backendCheck = 'unknown'
+      backendDetail = couldNot[1].trim().slice(0, 300)
+    }
     const f = /FATAL: (.+)/.exec(line)
     if (f) fatal = f[1].trim().slice(0, 400)
     if (line.includes('Backend chain check: the Electrum backend follows')) {
@@ -207,8 +234,8 @@ export const main = sdk.setupMain(async ({ effects }) => {
       lines.forEach(onLine)
     }
   }
-  const stdout = lineReader()
-  const stderr = lineReader()
+  let stdout = lineReader()
+  let stderr = lineReader()
 
   const listening = () =>
     sdk.healthCheck.checkPortListening(effects, electrumPort, {
@@ -230,6 +257,9 @@ export const main = sdk.setupMain(async ({ effects }) => {
           backfillProgress = null
           backfillWaiting = null
           backfillNote = null
+          stdout = lineReader()
+          stderr = lineReader()
+          starts++
           waitingForNodeSync = false
           waitingForCookie = false
           backendCheck = 'unknown'
@@ -248,10 +278,16 @@ for i in $(seq 1 300); do
   [ "$i" = 1 ] && echo "Waiting for the node's RPC cookie"
   sleep 1
 done
+# The trap first, so a stop that arrives as Frigate starts still reaches it
+pid=""; term=""
+# (or, with Frigate not running, as in the hold below, ends this at once)
+trap 'term=1; if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then kill -TERM "$pid"; else exit 0; fi' TERM INT
 /usr/local/bin/docker-entrypoint.sh &
 pid=$!
-trap 'kill -TERM "$pid" 2>/dev/null; wait "$pid"; exit 0' TERM INT
-wait "$pid"; rc=$?
+[ -n "$term" ] && kill -TERM "$pid" 2>/dev/null
+# wait returns early when a trapped signal arrives: wait again for Frigate itself to finish
+while :; do wait "$pid"; rc=$?; kill -0 "$pid" 2>/dev/null || break; done
+[ -n "$term" ] && exit 0
 # 3: a stop that restarting cannot fix (a block the index needs was pruned, or the index belongs to
 # another chain). Hold here rather than restart into the same stop every 30 seconds, so the FATAL
 # line stays the health message until Rebuild Index restarts the service.
@@ -276,6 +312,14 @@ exit "$rc"`,
           if (fatal) return { result: 'failure', message: fatal }
           if (!rpc) {
             return { result: 'starting', message: i18n('Waiting for the node') }
+          }
+          if (lastError && starts > 1) {
+            return {
+              result: 'failure',
+              message: i18n('Frigate stopped and is restarting: ${error}', {
+                error: lastError,
+              }),
+            }
           }
           if (waitingForCookie) {
             return {
@@ -304,6 +348,20 @@ exit "$rc"`,
         fn: async () => {
           const start = await indexStart()
           if ((await listening()).result === 'success') {
+            // the node gone for over two minutes while Frigate keeps serving the tip it had
+            if (
+              pollErrorSince !== null &&
+              Date.now() - pollErrorAt < 60_000 &&
+              pollErrorAt - pollErrorSince > 120_000
+            ) {
+              return {
+                result: 'failure',
+                message: i18n(
+                  'Frigate cannot reach ${node}, so wallets see the chain as it was when it last could. ${detail}',
+                  { node: node.title, detail: pollError ?? '' },
+                ),
+              }
+            }
             const synced = start
               ? i18n(
                   'Fully synced. Silent Payments are indexed from block ${start}.',
@@ -369,6 +427,15 @@ exit "$rc"`,
               message: i18n(
                 '${indexer} is not reachable: install it, or start it, or choose another with Select Indexer',
                 { indexer: indexer.title },
+              ),
+            }
+          }
+          if (backendCheck === 'unknown' && backendDetail) {
+            return {
+              result: 'loading',
+              message: i18n(
+                'Frigate could not reach ${indexer} at its last check (every 10 minutes); wallets cannot be served until it can. ${detail}',
+                { indexer: indexer.title, detail: backendDetail },
               ),
             }
           }

@@ -47,7 +47,7 @@ const inputSpec = InputSpec.of({
     required: true,
     integer: true,
     min: 0,
-    max: null,
+    max: 10000000,
     default: taprootActivationHeight,
   }),
   rebuildIndex: Value.toggle({
@@ -73,7 +73,7 @@ const inputSpec = InputSpec.of({
     required: false,
     integer: true,
     min: 0,
-    max: null,
+    max: 10000000,
     default: null,
   }),
   lookBackSpeed: Value.select({
@@ -121,7 +121,7 @@ const inputSpec = InputSpec.of({
     required: true,
     integer: true,
     min: 1,
-    max: null,
+    max: 10000000,
     default: 300000,
   }),
 })
@@ -143,7 +143,9 @@ export const configure = sdk.Action.withInput(
         ? `${what} ${i18n('This index starts at block ${start}.', { start })}`
         : what
     })(),
-    warning: null,
+    warning: i18n(
+      'Changing Index Start Height, or turning on Rebuild Index, deletes the Silent Payments index and builds it again. With Look Back for Payments on, the new index looks back again too.',
+    ),
     allowedStatuses: 'any',
     group: null,
     visibility: 'enabled',
@@ -188,14 +190,6 @@ export const configure = sdk.Action.withInput(
       input.rebuildIndex ||
       (before !== null && before.index.startHeight !== input.indexStartHeight)
     if (rebuild) await writeFile(rebuildRequest, '')
-    const changed =
-      !before ||
-      before.index.startHeight !== input.indexStartHeight ||
-      before.index.cacheSize !== input.scriptPubKeyCacheSize ||
-      before.scan.computeBackend !== input.computeBackend ||
-      before.scan.batchSize !== input.batchSize ||
-      before.index.backfillFromHeight !== backfillFromHeight ||
-      (before.index.backfillSpeed ?? 'background') !== input.lookBackSpeed
     const settings = {
       startHeight: input.indexStartHeight,
       cacheSize: input.scriptPubKeyCacheSize,
@@ -227,6 +221,11 @@ export const configure = sdk.Action.withInput(
         scan: { ...before.scan, ...scan },
       })
     }
+    const after = await config.read().once()
+    const changed =
+      !before ||
+      JSON.stringify({ index: before.index, scan: before.scan }) !==
+        JSON.stringify({ index: after?.index, scan: after?.scan })
     // A changed setting restarts Frigate by itself (main watches them). A rebuild alone changes
     // nothing main watches, so restart it here, the way Fulcrum Pruned's Reindex does: wait out a
     // start in progress, and ask twice if it is still starting, since one request mid-start is

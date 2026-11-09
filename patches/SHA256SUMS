@@ -1,0 +1,10 @@
+2b4b737cd84c823b3f43b6d478cc8291fa3dd793a104497cd8396ee1a428c9b1  0001-retry-block-fetches-during-indexing-when-the-bitcoin.patch
+3a27ccaeae05bec962f7da017acf7285484b230da4aab8889938f26e48731bac  0002-send-notifications-without-an-id-and-document-silent.patch
+1bc717a48ea008d44abef67a2c3db23b27d123fd6b6e3af8d74909ae472820d3  0003-Serve-the-node-s-own-tip-header-and-index-a-pruned-n.patch
+8d616c5b477f3d53351e764a10488d4d9af517a554999bcae42ba8fe8adaf90f  0004-Electrum-protocol-1.8-on-a-chain-with-v2-headers-and.patch
+3a0b26fd43e37afc0399252ed994f4881db562d40f33e5a85349e1b6df57e248  0005-Stop-when-the-index-belongs-to-another-chain-than-th.patch
+f6529ba76dc44d5d85cf7a4048eb89b83b190b2a31d84fcc032f97fd32cbd241  0006-Stop-indexing-promptly-on-shutdown.patch
+7a17d71c88e652c5443417d14331abe2af1fc3909b5eaad7424a0c3d86c5e4e0  0007-Look-up-confirmed-transactions-through-the-backend-f.patch
+2394256bad90bce3532b6076baf6489cf2439c32dfc70dac6fd5c87a71745d9c  0008-Backfill-index-blocks-below-where-a-pruned-node-s-in.patch
+458114e2a1b9ee67f9d69cdff605bdbdc241f95030213a51064807513288e7f3  0009-Fixes-from-a-review-of-the-whole-series.patch
+d5ce745fa3cda5e04839bee1c2638bbe5b7f9aa86ac1b62de1f1efa03d7aeb9b  0010-Hardening-from-an-adversarial-review.patch

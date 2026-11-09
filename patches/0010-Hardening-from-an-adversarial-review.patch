@@ -1,0 +1,484 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Paul Lamb <paul@paulscode.com>
+Date: Mon, 9 Nov 2026 11:07:05 -0600
+Subject: [PATCH 10/10] Hardening from an adversarial review
+
+- a block that fails to write (a full disk) stops indexing and is retried,
+  instead of being skipped for good behind the next block's marker
+- start-height and recentblocks written whole (temp file, fsync, rename); a
+  damaged recentblocks is read as empty instead of failing every start
+- a config.toml that cannot be read stops Frigate with the reason, instead of
+  running on defaults against another node and no backend
+- the wait for a node behind the index gives up when the node stops advancing
+- the fork point search is serialized, a failure remembered per tip, and a
+  backend's blake2b_fork passed on only if the node has that block there
+- the backend chain check uses the configured TLS, and rechecks every minute
+  while it reports another chain
+- backfill: cancelled lookups end; wallets rescanned every 10 minutes, not
+  every minute; the getblockfrompeer path waits while the node is half again
+  over its prune target
+- a wallet scanning from below the index's first block is noted in the log
+- frigate.log rolls at 10 MB, three old files kept
+---
+ .../frigate/bitcoind/Backfill.java            | 31 +++++++-
+ .../frigate/bitcoind/BitcoindClient.java      | 24 ++++++-
+ .../bitcoind/BitcoindClientService.java       |  3 +
+ .../frigate/electrum/BackendChainCheck.java   |  6 +-
+ .../electrum/ElectrumServerService.java       | 19 +++++
+ .../sparrowwallet/frigate/index/Index.java    | 11 ++-
+ .../frigate/index/IndexQuerier.java           | 11 +++
+ .../com/sparrowwallet/frigate/io/Config.java  |  3 +-
+ .../frigate/io/RecentBlocksMap.java           | 13 ++--
+ .../com/sparrowwallet/frigate/io/Storage.java | 23 ++++++
+ src/main/resources/logback.xml                | 12 +++-
+ .../frigate/io/DurableFilesTest.java          | 72 +++++++++++++++++++
+ 12 files changed, 212 insertions(+), 16 deletions(-)
+ create mode 100644 src/test/java/com/sparrowwallet/frigate/io/DurableFilesTest.java
+
+diff --git a/src/main/java/com/sparrowwallet/frigate/bitcoind/Backfill.java b/src/main/java/com/sparrowwallet/frigate/bitcoind/Backfill.java
+index 7284c73..758210f 100644
+--- a/src/main/java/com/sparrowwallet/frigate/bitcoind/Backfill.java
++++ b/src/main/java/com/sparrowwallet/frigate/bitcoind/Backfill.java
+@@ -48,7 +48,9 @@ public class Backfill {
+     static final long RETRY_INITIAL_MILLIS = 5_000;
+     static final long RETRY_MAX_MILLIS = 600_000;
+     static final long PEER_WAIT_MILLIS = 30_000;
+-    static final long NOTIFY_INTERVAL_MILLIS = 60_000;
++    //each notice queues a scan per subscribed wallet, so not too often: a payment found reaches wallets within this
++    static final long NOTIFY_INTERVAL_MILLIS = 10 * 60_000;
++    static final long NODE_DISK_WAIT_MILLIS = 60_000;
+     static final long PROGRESS_LOG_MILLIS = 30_000;
+     static final long CHAIN_CHECK_WAIT_MILLIS = 60_000;
+     static final long BACKEND_REQUEST_TIMEOUT_MILLIS = 180_000;
+@@ -372,6 +374,7 @@ public class Backfill {
+      * until it next prunes, as it would a new one; it adds no undo data.
+      */
+     private Block fetchBlockFromPeer(BitcoindClientService service, String blockHash) {
++        waitWhileNodeOverPruneTarget(service);
+         List<PeerInfo> peers = new ArrayList<>(service.getPeerInfo().stream().filter(PeerInfo::servesHistoricalBlocks).toList());
+         if(peers.isEmpty()) {
+             throw new IllegalStateException("the node has no peer that serves old blocks, to fetch pruned block " + blockHash + " from");
+@@ -410,6 +413,29 @@ public class Backfill {
+         throw new IllegalStateException("no peer sent pruned block " + blockHash);
+     }
+ 
++    /**
++     * A block fetched with getblockfrompeer is stored on the node until a block file holding it can be pruned, which is not before the
++     * newest block in that file is 288 deep. A fast backfill can so push the node well past its prune target. Wait while it is more
++     * than half again over.
++     */
++    private void waitWhileNodeOverPruneTarget(BitcoindClientService service) {
++        boolean logged = false;
++        while(!stopped) {
++            Map<String, Object> info = service.getBlockchainInfoMap();
++            Object size = info.get("size_on_disk");
++            Object target = info.get("prune_target_size");
++            if(!(size instanceof Number s) || !(target instanceof Number t) || t.longValue() <= 0 || s.longValue() <= t.longValue() * 3 / 2) {
++                return;
++            }
++            if(!logged) {
++                log.warn("Backfill waiting: the node holds {} MB, over its prune target of {} MB, with blocks fetched for the backfill; waiting for it to prune",
++                        s.longValue() / 1_000_000, t.longValue() / 1_000_000);
++                logged = true;
++            }
++            sleep(NODE_DISK_WAIT_MILLIS);
++        }
++    }
++
+     /**
+      * Checks a block fetched from peers against the node's header: the header must hash to the block asked for, and the transactions
+      * must be the ones it commits to, txids through the Merkle root and witness data through the coinbase's witness commitment (BIP141).
+@@ -613,6 +639,9 @@ public class Backfill {
+     private Transaction lookUpTransaction(Sha256Hash txid) throws InterruptedException {
+         long delay = RETRY_INITIAL_MILLIS;
+         for(int attempt = 1; !stopped; attempt++) {
++            if(Thread.currentThread().isInterrupted()) {
++                return null; //cancelled: the block it was for is being retried or abandoned
++            }
+             BackendConnection connection = connections.poll(1, TimeUnit.SECONDS);
+             if(connection == null) {
+                 continue;
+diff --git a/src/main/java/com/sparrowwallet/frigate/bitcoind/BitcoindClient.java b/src/main/java/com/sparrowwallet/frigate/bitcoind/BitcoindClient.java
+index 5bcf15b..f0b3b65 100644
+--- a/src/main/java/com/sparrowwallet/frigate/bitcoind/BitcoindClient.java
++++ b/src/main/java/com/sparrowwallet/frigate/bitcoind/BitcoindClient.java
+@@ -47,6 +47,7 @@ public class BitcoindClient {
+     //blocks above a pruned node's prune height that a new index skips, so the node's next prune (which drops whole block files at a
+     //time) does not take the first blocks before they are indexed
+     static final int PRUNE_MARGIN = 6;
++    private static final long NODE_CATCH_UP_STALL_MILLIS = 10 * 60_000;
+     public static final int MIN_SUBMIT_PACKAGE_VERSION = 280000;
+ 
+     private static final int FLUSH_BATCH_SIZE = 50;
+@@ -296,7 +297,23 @@ public class BitcoindClient {
+             return; //not a header the node knows
+         }
+         log.info("The node is at block {}, behind this index (block {}) on the same chain: waiting for it to catch up", blockchainInfo.blocks(), markerHeight);
+-        while(!stopped && getBitcoindService().getBlockchainInfo().blocks() < markerHeight) {
++        //only while it makes progress: a node that knows the block only on a branch it has left (a reorg to a shorter, heavier
++        //chain; invalidateblock) never reaches it, and the check after this then rolls back or reports another chain
++        int lastHeight = blockchainInfo.blocks();
++        long lastProgress = System.currentTimeMillis();
++        while(!stopped) {
++            int height = getBitcoindService().getBlockchainInfo().blocks();
++            if(height >= markerHeight) {
++                return;
++            }
++            if(height > lastHeight) {
++                lastHeight = height;
++                lastProgress = System.currentTimeMillis();
++            } else if(System.currentTimeMillis() - lastProgress > NODE_CATCH_UP_STALL_MILLIS) {
++                log.warn("The node has stayed at block {} for {} minutes, below this index (block {}): checking the index against it as it is",
++                        height, NODE_CATCH_UP_STALL_MILLIS / 60_000, markerHeight);
++                return;
++            }
+             try {
+                 Thread.sleep(10_000);
+             } catch(InterruptedException e) {
+@@ -378,7 +395,7 @@ public class BitcoindClient {
+      *
+      * @return the fork point, or null if the chain has no v2 header
+      */
+-    public ServerFeatures.Blake2bFork getBlake2bForkPoint() {
++    public synchronized ServerFeatures.Blake2bFork getBlake2bForkPoint() {
+         ElectrumBlockHeader current = tip;
+         if(current == null || !current.isV2()) {
+             return null;
+@@ -410,6 +427,9 @@ public class BitcoindClient {
+             return found;
+         } catch(RuntimeException e) {
+             log.warn("Could not find the BLAKE2b fork point", e);
++            //remembered against this tip, so the next call does not rerun the search at once
++            forkPoint = null;
++            forkPointTip = current.hex();
+             return null;
+         }
+     }
+diff --git a/src/main/java/com/sparrowwallet/frigate/bitcoind/BitcoindClientService.java b/src/main/java/com/sparrowwallet/frigate/bitcoind/BitcoindClientService.java
+index 35a2897..35d00fd 100644
+--- a/src/main/java/com/sparrowwallet/frigate/bitcoind/BitcoindClientService.java
++++ b/src/main/java/com/sparrowwallet/frigate/bitcoind/BitcoindClientService.java
+@@ -39,6 +39,9 @@ public interface BitcoindClientService {
+     @JsonRpcMethod("getblockchaininfo")
+     BlockchainInfo getBlockchainInfo();
+ 
++    @JsonRpcMethod("getblockchaininfo")
++    Map<String, Object> getBlockchainInfoMap();
++
+     @JsonRpcMethod("getblockhash")
+     String getBlockHash(@JsonRpcParam("height") int height);
+ 
+diff --git a/src/main/java/com/sparrowwallet/frigate/electrum/BackendChainCheck.java b/src/main/java/com/sparrowwallet/frigate/electrum/BackendChainCheck.java
+index 5aee7b0..5bbadd8 100644
+--- a/src/main/java/com/sparrowwallet/frigate/electrum/BackendChainCheck.java
++++ b/src/main/java/com/sparrowwallet/frigate/electrum/BackendChainCheck.java
+@@ -56,7 +56,8 @@ public final class BackendChainCheck {
+             while(!Thread.currentThread().isInterrupted()) {
+                 record(checkOnce(bitcoindClient, backend));
+                 try {
+-                    TimeUnit.MINUTES.sleep(INTERVAL_MINUTES);
++                    //while wallets are refused, recheck every minute, so a fixed backend is accepted soon after
++                    TimeUnit.MINUTES.sleep(state == State.DIFFERENT ? 1 : INTERVAL_MINUTES);
+                 } catch(InterruptedException e) {
+                     return;
+                 }
+@@ -89,7 +90,8 @@ public final class BackendChainCheck {
+     }
+ 
+     static Result checkOnce(BitcoindClient bitcoindClient, Server backend) {
+-        ElectrumTransport transport = new ElectrumTransport(backend.getHostAndPort(), backend.getProtocol(), new Object(), REQUEST_TIMEOUT_MILLIS);
++        ElectrumTransport transport = new ElectrumTransport(backend.getHostAndPort(), backend.getProtocol(), new Object(), REQUEST_TIMEOUT_MILLIS,
++                com.sparrowwallet.frigate.io.BackendTls.fromConfig(com.sparrowwallet.frigate.io.Config.get().getServer()));
+         try {
+             transport.connect();
+             Thread reader = Thread.ofVirtual().name("BackendChainCheckReader").start(transport::readInputLoop);
+diff --git a/src/main/java/com/sparrowwallet/frigate/electrum/ElectrumServerService.java b/src/main/java/com/sparrowwallet/frigate/electrum/ElectrumServerService.java
+index ff1157d..0e66ba6 100644
+--- a/src/main/java/com/sparrowwallet/frigate/electrum/ElectrumServerService.java
++++ b/src/main/java/com/sparrowwallet/frigate/electrum/ElectrumServerService.java
+@@ -44,6 +44,7 @@ public class ElectrumServerService {
+     //read by the event bus thread (notifyHeaders) as well as the session's
+     private volatile Version protocolVersion;
+     private volatile BackendSession.VersionRequest backendVersionRequest;
++    private boolean warnedBelowIndexStart;
+     private String genesisHash;
+     private java.util.function.BooleanSupplier chainHasV2Headers;
+ 
+@@ -236,6 +237,10 @@ public class ElectrumServerService {
+                     .withBlake2bFork(null);
+         }
+         ServerFeatures result = features.withProtocol(PROTOCOL_VERSION_V2.get(), PROTOCOL_VERSION_V2.get());
++        //the backend's fork point only if the node has that block at that height: otherwise the node's own
++        if(result.blake2b_fork() != null && bitcoindClient != null && !forkPointOnNode(result.blake2b_fork())) {
++            result = result.withBlake2bFork(null);
++        }
+         if(result.blake2b_fork() == null && bitcoindClient != null) {
+             ServerFeatures.Blake2bFork fork = bitcoindClient.getBlake2bForkPoint();
+             if(fork != null) {
+@@ -245,6 +250,14 @@ public class ElectrumServerService {
+         return result;
+     }
+ 
++    private boolean forkPointOnNode(ServerFeatures.Blake2bFork fork) {
++        try {
++            return fork.hash() != null && fork.hash().equalsIgnoreCase(bitcoindClient.getBitcoindService().getBlockHash(fork.height()));
++        } catch(RuntimeException e) {
++            return false;
++        }
++    }
++
+     /**
+      * @return the backend's version, raised to bound (atLeast) or lowered to it, or bound itself if the backend's is missing or unreadable
+      */
+@@ -684,6 +697,12 @@ public class ElectrumServerService {
+         }
+ 
+         int startHeight = effectiveStart;
++        int indexStart = indexQuerier == null ? -1 : indexQuerier.getIndexStartHeight();
++        if(indexStart > 0 && startHeight < indexStart && !warnedBelowIndexStart) {
++            warnedBelowIndexStart = true;
++            log.info("A wallet asked to scan from block " + startHeight + ", below this index's first block " + indexStart
++                    + ": payments before block " + indexStart + " are not found unless the index looks back further (backfill)");
++        }
+         SilentPaymentAddressSubscription subscription = requestHandler.subscribeSilentPaymentsAddress(silentPaymentScanAddress, labelSet, startHeight);
+ 
+         requestHandler.runAfterResponse(() -> {
+diff --git a/src/main/java/com/sparrowwallet/frigate/index/Index.java b/src/main/java/com/sparrowwallet/frigate/index/Index.java
+index 531b4ff..4a62e7e 100644
+--- a/src/main/java/com/sparrowwallet/frigate/index/Index.java
++++ b/src/main/java/com/sparrowwallet/frigate/index/Index.java
+@@ -248,7 +248,7 @@ public class Index {
+         File file = new File(Storage.getFrigateDbDir(), START_HEIGHT_FILENAME);
+         try {
+             if(!hasIndexedBlocks()) {
+-                Files.writeString(file.toPath(), nextHeight + "\n");
++                writeStartHeight(nextHeight);
+                 return nextHeight;
+             }
+             return file.exists() ? Integer.parseInt(Files.readString(file.toPath()).trim()) : -1;
+@@ -350,6 +350,12 @@ public class Index {
+             }
+         } catch(Exception e) {
+             log.error("Error adding to index", e);
++            if(height > 0 && blockHash != null) {
++                //a block that is not written must not be skipped: the next block's marker would cover it, leaving a gap no later run
++                //fills. Remove whatever rows of it were appended (they are above the marker) and let the caller retry it
++                repairOrphanTweaks();
++                throw new IllegalStateException("Could not add block " + height + " to the index: " + e.getMessage(), e);
++            }
+         }
+     }
+ 
+@@ -526,8 +532,7 @@ public class Index {
+         File file = new File(Storage.getFrigateDbDir(), START_HEIGHT_FILENAME);
+         File tmp = new File(Storage.getFrigateDbDir(), START_HEIGHT_FILENAME + ".tmp");
+         try {
+-            Files.writeString(tmp.toPath(), startHeight + "\n");
+-            Files.move(tmp.toPath(), file.toPath(), java.nio.file.StandardCopyOption.REPLACE_EXISTING, java.nio.file.StandardCopyOption.ATOMIC_MOVE);
++            Storage.writeDurably(tmp, file, (startHeight + "\n").getBytes(java.nio.charset.StandardCharsets.US_ASCII));
+         } catch(IOException e) {
+             throw new IllegalStateException("Could not write " + file, e);
+         }
+diff --git a/src/main/java/com/sparrowwallet/frigate/index/IndexQuerier.java b/src/main/java/com/sparrowwallet/frigate/index/IndexQuerier.java
+index c8b9709..01c2af7 100644
+--- a/src/main/java/com/sparrowwallet/frigate/index/IndexQuerier.java
++++ b/src/main/java/com/sparrowwallet/frigate/index/IndexQuerier.java
+@@ -65,6 +65,17 @@ public class IndexQuerier {
+         }
+     }
+ 
++    /**
++     * @return the first block the index covers, or -1 if it is not recorded
++     */
++    public int getIndexStartHeight() {
++        try {
++            return blocksIndex == null ? -1 : blocksIndex.readStartHeight();
++        } catch(RuntimeException e) {
++            return -1;
++        }
++    }
++
+     public void close() {
+         if(metricsExecutor != null) {
+             metricsExecutor.shutdownNow();
+diff --git a/src/main/java/com/sparrowwallet/frigate/io/Config.java b/src/main/java/com/sparrowwallet/frigate/io/Config.java
+index 47a1b34..c541610 100644
+--- a/src/main/java/com/sparrowwallet/frigate/io/Config.java
++++ b/src/main/java/com/sparrowwallet/frigate/io/Config.java
+@@ -64,7 +64,8 @@ public class Config {
+                     return config;
+                 }
+             } catch(Exception e) {
+-                log.error("Error reading " + tomlFile.getAbsolutePath(), e);
++                //carrying on with defaults would point Frigate at another node and no backend, and look like a connection fault
++                throw new com.sparrowwallet.frigate.ConfigurationException("Cannot read " + tomlFile.getAbsolutePath() + ": " + e.getMessage(), e);
+             }
+         } else if(jsonFile.exists()) {
+             try {
+diff --git a/src/main/java/com/sparrowwallet/frigate/io/RecentBlocksMap.java b/src/main/java/com/sparrowwallet/frigate/io/RecentBlocksMap.java
+index e65dec2..6bc6923 100644
+--- a/src/main/java/com/sparrowwallet/frigate/io/RecentBlocksMap.java
++++ b/src/main/java/com/sparrowwallet/frigate/io/RecentBlocksMap.java
+@@ -91,8 +91,11 @@ public class RecentBlocksMap {
+                     }
+                 }
+             }
+-        } catch(IOException e) {
+-            // Ignore and start with empty map
++        } catch(IOException | RuntimeException e) {
++            //a file cut short (power lost mid-write, a full disk) is not worth refusing to start over: begin with no recent blocks,
++            //which only means the next few blocks are not checked against earlier hashes
++            org.slf4j.LoggerFactory.getLogger(RecentBlocksMap.class).warn("Ignoring an unreadable " + RECENT_BLOCKS_FILENAME + " file (" + e.getMessage() + ")");
++            this.data.clear();
+         }
+     }
+ 
+@@ -104,10 +107,8 @@ public class RecentBlocksMap {
+                 Storage.createOwnerOnlyFile(recentBlocksFile);
+             }
+ 
+-            try(Writer writer = new FileWriter(recentBlocksFile)) {
+-                gson.toJson(this.data, writer);
+-                writer.flush();
+-            }
++            File tmp = new File(recentBlocksFile.getParentFile(), RECENT_BLOCKS_FILENAME + ".tmp");
++            Storage.writeDurably(tmp, recentBlocksFile, gson.toJson(this.data).getBytes(java.nio.charset.StandardCharsets.UTF_8));
+         } catch(IOException e) {
+             //Ignore
+         }
+diff --git a/src/main/java/com/sparrowwallet/frigate/io/Storage.java b/src/main/java/com/sparrowwallet/frigate/io/Storage.java
+index a0ae9a9..2c87998 100644
+--- a/src/main/java/com/sparrowwallet/frigate/io/Storage.java
++++ b/src/main/java/com/sparrowwallet/frigate/io/Storage.java
+@@ -28,6 +28,29 @@ public class Storage {
+ 
+     private static File ufsecpExtensionFile;
+ 
++    /**
++     * Replaces target with bytes so that a crash leaves either the old file or the new one whole: written to tmp, synced to disk,
++     * renamed over target, and the directory synced. tmp is created owner-only, like the files it replaces.
++     */
++    public static void writeDurably(File tmp, File target, byte[] bytes) throws IOException {
++        java.nio.file.Files.deleteIfExists(tmp.toPath());
++        createOwnerOnlyFile(tmp);
++        try(java.nio.channels.FileChannel channel = java.nio.channels.FileChannel.open(tmp.toPath(), java.nio.file.StandardOpenOption.WRITE,
++                java.nio.file.StandardOpenOption.TRUNCATE_EXISTING)) {
++            java.nio.ByteBuffer buffer = java.nio.ByteBuffer.wrap(bytes);
++            while(buffer.hasRemaining()) {
++                channel.write(buffer);
++            }
++            channel.force(true);
++        }
++        java.nio.file.Files.move(tmp.toPath(), target.toPath(), java.nio.file.StandardCopyOption.REPLACE_EXISTING, java.nio.file.StandardCopyOption.ATOMIC_MOVE);
++        try(java.nio.channels.FileChannel dir = java.nio.channels.FileChannel.open(target.getParentFile().toPath(), java.nio.file.StandardOpenOption.READ)) {
++            dir.force(true);
++        } catch(IOException e) {
++            //not every filesystem lets a directory be opened for syncing; the rename itself is still atomic
++        }
++    }
++
+     public static synchronized File getUfsecpExtensionFile() {
+         if(ufsecpExtensionFile == null) {
+             ufsecpExtensionFile = getExtensionFile(UFSECP_EXTENSION_FILENAME);
+diff --git a/src/main/resources/logback.xml b/src/main/resources/logback.xml
+index c709710..db21bc7 100644
+--- a/src/main/resources/logback.xml
++++ b/src/main/resources/logback.xml
+@@ -10,8 +10,18 @@
+         <application>frigate</application>
+     </define>
+ 
+-    <appender name="FILE" class="ch.qos.logback.core.FileAppender">
++    <!-- Rolled at 10 MB, three old files kept: a long node outage logs a stack trace every few seconds, which an unrotated file
++         turns into a full disk -->
++    <appender name="FILE" class="ch.qos.logback.core.rolling.RollingFileAppender">
+         <file>${appDir}/frigate.log</file>
++        <rollingPolicy class="ch.qos.logback.core.rolling.FixedWindowRollingPolicy">
++            <fileNamePattern>${appDir}/frigate.%i.log</fileNamePattern>
++            <minIndex>1</minIndex>
++            <maxIndex>3</maxIndex>
++        </rollingPolicy>
++        <triggeringPolicy class="ch.qos.logback.core.rolling.SizeBasedTriggeringPolicy">
++            <maxFileSize>10MB</maxFileSize>
++        </triggeringPolicy>
+         <encoder>
+             <pattern>%date %level [%thread] %logger{10} %msg%n</pattern>
+         </encoder>
+diff --git a/src/test/java/com/sparrowwallet/frigate/io/DurableFilesTest.java b/src/test/java/com/sparrowwallet/frigate/io/DurableFilesTest.java
+new file mode 100644
+index 0000000..6aae939
+--- /dev/null
++++ b/src/test/java/com/sparrowwallet/frigate/io/DurableFilesTest.java
+@@ -0,0 +1,72 @@
++package com.sparrowwallet.frigate.io;
++
++import com.sparrowwallet.frigate.ConfigurationException;
++import com.sparrowwallet.frigate.Frigate;
++import org.junit.jupiter.api.AfterEach;
++import org.junit.jupiter.api.BeforeEach;
++import org.junit.jupiter.api.Test;
++import org.junit.jupiter.api.io.TempDir;
++
++import java.io.File;
++import java.nio.charset.StandardCharsets;
++import java.nio.file.Files;
++import java.nio.file.Path;
++
++import static org.junit.jupiter.api.Assertions.*;
++
++/**
++ * Files Frigate keeps beside its index, as a crash or a full disk can leave them, and a config.toml that cannot be read.
++ */
++public class DurableFilesTest {
++    @TempDir
++    Path tempDir;
++
++    private String previousHome;
++
++    @BeforeEach
++    public void setUp() {
++        previousHome = System.getProperty(Frigate.APP_HOME_PROPERTY);
++        System.setProperty(Frigate.APP_HOME_PROPERTY, tempDir.resolve("home").toString());
++        Storage.getFrigateDir().mkdirs();
++        Config.setInstance(null);
++    }
++
++    @AfterEach
++    public void tearDown() {
++        Config.setInstance(null);
++        if(previousHome == null) {
++            System.clearProperty(Frigate.APP_HOME_PROPERTY);
++        } else {
++            System.setProperty(Frigate.APP_HOME_PROPERTY, previousHome);
++        }
++    }
++
++    @Test
++    public void aTruncatedRecentBlocksFileDoesNotStopAStart() throws Exception {
++        File file = new File(Storage.getFrigateDir(), "recentblocks");
++        Files.writeString(file.toPath(), "{\n  \"969302\": \"00000000000000000001", StandardCharsets.UTF_8);
++        RecentBlocksMap map = assertDoesNotThrow(() -> new RecentBlocksMap(10));
++        assertNull(map.getTipHeight());
++
++        map.put(969303, "ab".repeat(32));
++        assertEquals("ab".repeat(32), new RecentBlocksMap(10).get(969303), "written whole, and read back");
++        assertFalse(new File(Storage.getFrigateDir(), "recentblocks.tmp").exists());
++    }
++
++    @Test
++    public void writesReplaceTheFileWhole() throws Exception {
++        File target = new File(Storage.getFrigateDir(), "start-height");
++        File tmp = new File(Storage.getFrigateDir(), "start-height.tmp");
++        Storage.writeDurably(tmp, target, "961640\n".getBytes(StandardCharsets.US_ASCII));
++        Storage.writeDurably(tmp, target, "958000\n".getBytes(StandardCharsets.US_ASCII));
++        assertEquals("958000\n", Files.readString(target.toPath()));
++        assertFalse(tmp.exists());
++    }
++
++    @Test
++    public void anUnreadableConfigStopsFrigateWithTheReason() throws Exception {
++        Files.writeString(new File(Storage.getFrigateDir(), "config.toml").toPath(), "[index]\nstartHeight = 99999999999\n");
++        ConfigurationException e = assertThrows(ConfigurationException.class, Config::get);
++        assertTrue(e.getMessage().contains("config.toml"), e.getMessage());
++    }
++}
