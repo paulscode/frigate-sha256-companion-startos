@@ -44,7 +44,7 @@ const dict = {
   Indexer: 40,
   '${indexer} follows the same chain as ${node}': 41,
   '${indexer} follows a different chain from ${node}, so wallets are refused. Point ${indexer} at ${node} (its Select Node), or select another indexer. ${detail}': 42,
-  'Checking that ${indexer} follows the same chain as ${node}. An indexer opens its Electrum port only once it has caught up with its node.': 43,
+  'Frigate checks that ${indexer} follows the same chain as ${node} once its own index has caught up. An indexer opens its Electrum port only once it has caught up with its node.': 43,
   'The official Bitcoin service, whichever flavor is installed: Knots or Core, on the SHA256 chain, or a BLAKE2b build that took its place.': 44,
   'A second node on the SHA256 chain, installed alongside your main Bitcoin service, pruned by default.': 45,
   'A node on the BLAKE2b chain, whose blocks use a different proof of work and a longer header, pruned by default.': 46,

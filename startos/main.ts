@@ -288,7 +288,7 @@ exec /usr/local/bin/docker-entrypoint.sh`,
           return {
             result: 'loading',
             message: i18n(
-              'Checking that ${indexer} follows the same chain as ${node}. An indexer opens its Electrum port only once it has caught up with its node.',
+              'Frigate checks that ${indexer} follows the same chain as ${node} once its own index has caught up. An indexer opens its Electrum port only once it has caught up with its node.',
               { indexer: indexer.title, node: node.title },
             ),
           }

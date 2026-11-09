@@ -1,11 +1,13 @@
 # AGENTS.md
 
-A StartOS service package: Frigate Electrum Server (SHA256) Companion, `frigate-sha256-companion`.
+A StartOS service package: one of the two Frigate Electrum Server companions, `frigate-sha256-companion`
+and `frigate-blake2b-companion` (see `startos/chain.ts` for which this is).
 Built locally with the workspace's `release.sh`, never in CI. SDK 3.1.1.
 
-- **Two packages, one codebase.** This package and `frigate-blake2b-companion-startos` are identical
-  except `startos/chain.ts`, the icons, `README.md`, `instructions.md` and the package name. Edit
-  here, then run `/mnt/Black/frigate-companions/tools/sync-packages.sh`.
+- **Two packages, one codebase.** `frigate-sha256-companion-startos` and
+  `frigate-blake2b-companion-startos` are identical except `startos/chain.ts`, the manifest id, the
+  icons, `README.md`, `instructions.md` and the package name. Edit the SHA256 one, then run
+  `/mnt/Black/frigate-companions/tools/sync-packages.sh`.
 - **Frigate's changes are `patches/`**, generated from a working tree in the frigate-companions
   project (`work/frigate-src`); never edit a patch file by hand. See UPDATING.md.
 - **No autoconfig task on the node, ever.** Pruned support is the point of this package.
