@@ -27,16 +27,18 @@ From the same review:
   same block every five seconds forever.
 - A shutdown during the first index no longer goes on to start the
   backend check and the Electrum server.
+- blockchain.transaction.id_from_pos forwards a missing merkle flag as
+  false, the protocol's default, not as null, which Electrs refuses.
 - A stop restarting cannot fix (a pruned block, an index from another
   chain) exits with 3, so a supervisor can wait for a rebuild instead of
   restarting into the same stop.
 ---
- .../com/sparrowwallet/frigate/Frigate.java    |  7 +++++-
- .../frigate/bitcoind/BitcoindClient.java      | 21 ++++++++++++++++
- .../electrum/ElectrumBackendService.java      |  3 +++
- .../electrum/ElectrumServerService.java       | 25 +++++++++++++++++--
- .../frigate/electrum/ProtocolV2Test.java      |  3 ++-
- 5 files changed, 55 insertions(+), 4 deletions(-)
+ .../com/sparrowwallet/frigate/Frigate.java    |  7 ++++-
+ .../frigate/bitcoind/BitcoindClient.java      | 21 ++++++++++++++
+ .../electrum/ElectrumBackendService.java      |  3 ++
+ .../electrum/ElectrumServerService.java       | 28 +++++++++++++++++--
+ .../frigate/electrum/ProtocolV2Test.java      |  3 +-
+ 5 files changed, 57 insertions(+), 5 deletions(-)
 
 diff --git a/src/main/java/com/sparrowwallet/frigate/Frigate.java b/src/main/java/com/sparrowwallet/frigate/Frigate.java
 index f1a7be3..7c81b70 100644
@@ -152,7 +154,7 @@ index 5cf6ef3..914b63c 100644
      TransactionMerkle getTransactionMerkle(@JsonRpcParam("tx_hash") String txHash, @JsonRpcParam("height") int height);
  
 diff --git a/src/main/java/com/sparrowwallet/frigate/electrum/ElectrumServerService.java b/src/main/java/com/sparrowwallet/frigate/electrum/ElectrumServerService.java
-index 9406741..c888a4d 100644
+index 9406741..b593537 100644
 --- a/src/main/java/com/sparrowwallet/frigate/electrum/ElectrumServerService.java
 +++ b/src/main/java/com/sparrowwallet/frigate/electrum/ElectrumServerService.java
 @@ -165,8 +165,9 @@ public class ElectrumServerService {
@@ -194,6 +196,16 @@ index 9406741..c888a4d 100644
          if(verbose) {
              try {
                  return bitcoindClient.getBitcoindService().getRawTransaction(tx_hash, true);
+@@ -574,7 +595,8 @@ public class ElectrumServerService {
+     public Object getTransactionIdFromPos(@JsonRpcParam("height") int height, @JsonRpcParam("tx_pos") int txPos, @JsonRpcParam("merkle") @JsonRpcOptional Boolean merkle) {
+         checkVersionNegotiated();
+         if(electrumBackendService != null) {
+-            return electrumBackendService.getTransactionIdFromPos(height, txPos, merkle);
++            //merkle defaults to false (the protocol's default); forwarding a missing one as null makes Electrs refuse the request
++            return electrumBackendService.getTransactionIdFromPos(height, txPos, merkle != null && merkle);
+         }
+ 
+         throw new UnsupportedOperationException("Configure backendElectrumServer to use blockchain.transaction.id_from_pos");
 diff --git a/src/test/java/com/sparrowwallet/frigate/electrum/ProtocolV2Test.java b/src/test/java/com/sparrowwallet/frigate/electrum/ProtocolV2Test.java
 index d3c992f..a4c40ec 100644
 --- a/src/test/java/com/sparrowwallet/frigate/electrum/ProtocolV2Test.java
