@@ -63,7 +63,7 @@ const inputSpec = InputSpec.of({
   lookBack: Value.select({
     name: i18n('Look Back for Payments'),
     description: i18n(
-      'Also find Silent Payments in blocks below where the index starts, which a pruned node has already discarded. Frigate fetches each of those blocks from peers, and the coins its transactions spend through the indexer, checking both against the node. It is done once for every wallet, wallets connected meanwhile are told what it finds, and changing this does not rebuild the index. It costs download traffic and time, roughly per 1,000 blocks: ${traffic} GB, and ${full} at full speed or ${background} in the background. Choose the oldest block your wallets need: the further back, the longer it takes.',
+      'Also find Silent Payments in blocks below where the index starts, which a pruned node has already discarded. Frigate fetches each of those blocks from peers, and the coins its transactions spend through the indexer, checking both against the node. It is done once and covers every wallet, wallets connected meanwhile are told what it finds, and changing this does not rebuild the index. It costs download traffic and time, roughly per 1,000 blocks: ${traffic} GB, and ${full} at full speed or ${background} in the background. Choose the oldest block your wallets need: the further back, the longer it takes.',
       {
         traffic: chain.backfillCost.trafficGb,
         full: chain.backfillCost.full,
@@ -203,28 +203,35 @@ export const configure = sdk.Action.withInput(
       before.scan.batchSize !== input.batchSize ||
       before.index.backfillFromHeight !== backfillFromHeight ||
       (before.index.backfillSpeed ?? 'background') !== input.lookBackSpeed
-    await config.merge(effects, {
-      index: {
-        startHeight: input.indexStartHeight,
-        cacheSize: input.scriptPubKeyCacheSize,
-        backfillSpeed: input.lookBackSpeed,
-      },
-      scan: {
-        computeBackend: input.computeBackend,
-        batchSize: input.batchSize,
-      },
-    })
-    // merge cannot remove a key, and Frigate reads a missing backfillFromHeight as off: write the
-    // index table whole for it
-    const merged = await config.read().once()
-    if (merged && merged.index.backfillFromHeight !== backfillFromHeight) {
-      const { backfillFromHeight: _old, ...index } = merged.index
+    const settings = {
+      startHeight: input.indexStartHeight,
+      cacheSize: input.scriptPubKeyCacheSize,
+      backfillSpeed: input.lookBackSpeed,
+    }
+    const scan = {
+      computeBackend: input.computeBackend,
+      batchSize: input.batchSize,
+    }
+    if (before === null) {
+      await config.merge(effects, {
+        index: {
+          ...settings,
+          ...(backfillFromHeight === undefined ? {} : { backfillFromHeight }),
+        },
+        scan,
+      })
+    } else {
+      // One write, so a change restarts Frigate once. Written whole rather than merged, because a
+      // merge cannot remove a key, and a missing backfillFromHeight is how Frigate reads "off".
+      const { backfillFromHeight: _old, ...index } = before.index
       await config.write(effects, {
-        ...merged,
-        index:
-          backfillFromHeight === undefined
-            ? index
-            : { ...index, backfillFromHeight },
+        ...before,
+        index: {
+          ...index,
+          ...settings,
+          ...(backfillFromHeight === undefined ? {} : { backfillFromHeight }),
+        },
+        scan: { ...before.scan, ...scan },
       })
     }
     // A changed setting restarts Frigate by itself (main watches them). A rebuild alone changes

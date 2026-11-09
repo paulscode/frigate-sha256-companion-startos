@@ -12,9 +12,9 @@ from the scriptPubKey cache or the Electrum backend, each transaction checked
 against its txid. One transaction per block with the position, so a stop resumes
 where it left off; connected wallets are scanned over each backfilled range.
 ---
- .../com/sparrowwallet/frigate/Frigate.java    |  10 +-
- .../frigate/bitcoind/Backfill.java            | 694 ++++++++++++++++++
- .../frigate/bitcoind/BitcoindClient.java      |  52 +-
+ .../com/sparrowwallet/frigate/Frigate.java    |  14 +-
+ .../frigate/bitcoind/Backfill.java            | 731 ++++++++++++++++++
+ .../frigate/bitcoind/BitcoindClient.java      |  69 +-
  .../bitcoind/BitcoindClientService.java       |   6 +
  .../frigate/bitcoind/PeerInfo.java            |  16 +
  .../frigate/electrum/RequestHandler.java      |  12 +
@@ -22,21 +22,23 @@ where it left off; connected wallets are scanned over each backfilled range.
  .../index/SilentPaymentsBackfillUpdate.java   |   8 +
  .../com/sparrowwallet/frigate/io/Config.java  |  33 +
  .../frigate/bitcoind/BackfillJobTest.java     | 117 +++
- .../frigate/bitcoind/BackfillVerifyTest.java  | 103 +++
+ .../frigate/bitcoind/BackfillVerifyTest.java  | 116 +++
+ .../bitcoind/FutureWitnessProgramTest.java    |  34 +
  .../frigate/index/IndexBackfillTest.java      | 118 +++
  .../frigate/index/IndexResumeTest.java        |   1 +
  .../frigate/bitcoind/block-980821.hex         |   1 +
- 14 files changed, 1339 insertions(+), 29 deletions(-)
+ 15 files changed, 1442 insertions(+), 31 deletions(-)
  create mode 100644 src/main/java/com/sparrowwallet/frigate/bitcoind/Backfill.java
  create mode 100644 src/main/java/com/sparrowwallet/frigate/bitcoind/PeerInfo.java
  create mode 100644 src/main/java/com/sparrowwallet/frigate/index/SilentPaymentsBackfillUpdate.java
  create mode 100644 src/test/java/com/sparrowwallet/frigate/bitcoind/BackfillJobTest.java
  create mode 100644 src/test/java/com/sparrowwallet/frigate/bitcoind/BackfillVerifyTest.java
+ create mode 100644 src/test/java/com/sparrowwallet/frigate/bitcoind/FutureWitnessProgramTest.java
  create mode 100644 src/test/java/com/sparrowwallet/frigate/index/IndexBackfillTest.java
  create mode 100644 src/test/resources/com/sparrowwallet/frigate/bitcoind/block-980821.hex
 
 diff --git a/src/main/java/com/sparrowwallet/frigate/Frigate.java b/src/main/java/com/sparrowwallet/frigate/Frigate.java
-index 7c81b70..f0f1374 100644
+index 7c81b70..54f92bd 100644
 --- a/src/main/java/com/sparrowwallet/frigate/Frigate.java
 +++ b/src/main/java/com/sparrowwallet/frigate/Frigate.java
 @@ -50,6 +50,8 @@ public class Frigate {
@@ -48,16 +50,20 @@ index 7c81b70..f0f1374 100644
      public void start() {
          getLogger().info("Starting " + SERVER_NAME + " v" + SERVER_VERSION + " on " + Network.get().getName());
          getLogger().info("Using home directory " + Storage.getFrigateHome().getAbsolutePath());
-@@ -88,6 +90,8 @@ public class Frigate {
+@@ -88,6 +90,12 @@ public class Frigate {
          InetSocketAddress sslBind = toBindAddress(serverConfig.getSslServer());
          if(bitcoindClient != null) {
              com.sparrowwallet.frigate.electrum.BackendChainCheck.start(bitcoindClient, serverConfig.getBackendElectrumServerObj());
 +            backfill = com.sparrowwallet.frigate.bitcoind.Backfill.start(bitcoindClient, blocksIndex,
 +                    Network.get() == Network.MAINNET ? MAINNET_TAPROOT_ACTIVATION_HEIGHT : TESTNET_TAPROOT_ACTIVATION_HEIGHT);
++            //a shutdown that ran before the backfill was assigned found nothing to stop
++            if(backfill != null && bitcoindClient.isStopped()) {
++                backfill.stop();
++            }
          }
          indexQuerier = new IndexQuerier(blocksIndex, mempoolIndex);
          electrumServer = new ElectrumServerRunnable(bitcoindClient, indexQuerier, tcpBind, sslBind, sslContext);
-@@ -105,7 +109,11 @@ public class Frigate {
+@@ -105,7 +113,11 @@ public class Frigate {
      public void stop() {
          getLogger().info(SERVER_NAME + " shutting down...");
  
@@ -72,10 +78,10 @@ index 7c81b70..f0f1374 100644
          }
 diff --git a/src/main/java/com/sparrowwallet/frigate/bitcoind/Backfill.java b/src/main/java/com/sparrowwallet/frigate/bitcoind/Backfill.java
 new file mode 100644
-index 0000000..0def7f0
+index 0000000..7284c73
 --- /dev/null
 +++ b/src/main/java/com/sparrowwallet/frigate/bitcoind/Backfill.java
-@@ -0,0 +1,694 @@
+@@ -0,0 +1,731 @@
 +package com.sparrowwallet.frigate.bitcoind;
 +
 +import com.github.arteam.simplejsonrpc.client.JsonRpcClient;
@@ -170,12 +176,18 @@ index 0000000..0def7f0
 +        Server backend = serverConfig.getBackendElectrumServerObj();
 +        Backfill backfill = new Backfill(bitcoindClient, index, minHeight, backend, backend == null ? null : BackendTls.fromConfig(serverConfig),
 +                indexConfig.getBackfillInFlight());
-+        Index.BackfillJob job = backfill.resolveJob(indexConfig.getBackfillFromHeight());
-+        if(job == null) {
++        //a fault here (the backfill state unreadable, say) must not keep Frigate from serving the index it has
++        try {
++            Index.BackfillJob job = backfill.resolveJob(indexConfig.getBackfillFromHeight());
++            if(job == null) {
++                return null;
++            }
++            backfill.startThread(job);
++            return backfill;
++        } catch(RuntimeException e) {
++            log.error("Backfill could not start; Frigate runs without it", e);
 +            return null;
 +        }
-+        backfill.startThread(job);
-+        return backfill;
 +    }
 +
 +    private void startThread(Index.BackfillJob job) {
@@ -402,19 +414,37 @@ index 0000000..0def7f0
 +        if(block == null) {
 +            return null;
 +        }
-+        verifyBlock(block, blockHash);
 +        return getTweaks(height, block);
 +    }
 +
++    /**
++     * @return the block, checked against the node's header, or null if the backfill stopped first
++     */
 +    private Block fetchBlock(BitcoindClientService service, String blockHash) {
++        String hex;
 +        try {
-+            return parseBlock((String)service.getBlock(blockHash, 0));
++            //an I/O error goes up to retrying; the node's own errors are answers
++            hex = (String)service.getBlock(blockHash, 0);
 +        } catch(JsonRpcException e) {
 +            if(!BitcoindClient.isPrunedBlockError(e)) {
 +                throw e;
 +            }
++            return fetchBlockFromPeer(service, blockHash);
 +        }
-+        return fetchBlockFromPeer(service, blockHash);
++        try {
++            return parseAndVerify(hex, blockHash);
++        } catch(RuntimeException e) {
++            //a block from btc-rpc-proxy that fails the checks came from a bad peer: asking again may reach the same one, so ask the
++            //node's own peers instead
++            log.warn("Backfill: block {} as fetched failed its checks ({}); asking the node's peers for it", blockHash, describe(e));
++            return fetchBlockFromPeer(service, blockHash);
++        }
++    }
++
++    private Block parseAndVerify(String hex, String blockHash) {
++        Block block = parseBlock(hex);
++        verifyBlock(block, blockHash);
++        return block;
 +    }
 +
 +    private Block parseBlock(String hex) {
@@ -446,10 +476,18 @@ index 0000000..0def7f0
 +            }
 +            long deadline = System.currentTimeMillis() + PEER_WAIT_MILLIS;
 +            while(!stopped && System.currentTimeMillis() < deadline) {
++                String hex;
 +                try {
-+                    return parseBlock((String)service.getBlock(blockHash, 0));
++                    hex = (String)service.getBlock(blockHash, 0);
 +                } catch(JsonRpcException e) {
 +                    sleep(1000);
++                    continue;
++                }
++                try {
++                    return parseAndVerify(hex, blockHash);
++                } catch(RuntimeException e) {
++                    log.warn("Backfill: block {} from peer {} failed its checks ({}); trying another peer", blockHash, peer.id(), describe(e));
++                    break;
 +                }
 +            }
 +        }
@@ -475,6 +513,11 @@ index 0000000..0def7f0
 +            //a repeated transaction can leave the Merkle root unchanged (CVE-2012-2459), so a block with one is a mutated copy
 +            if(!seen.add(tx.getTxId())) {
 +                throw new IllegalStateException("fetched block " + blockHash + " repeats transaction " + tx.getTxId());
++            }
++            //a 64 byte transaction can be an inner node of the Merkle tree passed off as a leaf, hiding the transactions below it
++            //behind an unchanged root; Bitcoin Core refuses any block with one (IsBlockMutated)
++            if(tx.bitcoinSerialize(false).length == 64) {
++                throw new IllegalStateException("fetched block " + blockHash + " has a 64 byte transaction " + tx.getTxId());
 +            }
 +            txids.add(tx.getTxId().getReversedBytes());
 +        }
@@ -695,7 +738,7 @@ index 0000000..0def7f0
 +            try {
 +                waitLock.wait(millis);
 +            } catch(InterruptedException e) {
-+                Thread.currentThread().interrupt();
++                //a stop is signalled by the flag, not an interrupt; keeping the interrupt would make every later wait return at once
 +            }
 +        }
 +    }
@@ -771,7 +814,7 @@ index 0000000..0def7f0
 +    }
 +}
 diff --git a/src/main/java/com/sparrowwallet/frigate/bitcoind/BitcoindClient.java b/src/main/java/com/sparrowwallet/frigate/bitcoind/BitcoindClient.java
-index b4a3345..7f308ae 100644
+index b4a3345..39e22b0 100644
 --- a/src/main/java/com/sparrowwallet/frigate/bitcoind/BitcoindClient.java
 +++ b/src/main/java/com/sparrowwallet/frigate/bitcoind/BitcoindClient.java
 @@ -318,7 +318,7 @@ public class BitcoindClient {
@@ -871,20 +914,37 @@ index b4a3345..7f308ae 100644
          byte[] scriptPubKeyBytes = scriptPubKeyCache.get(hashIndex);
          if(scriptPubKeyBytes != null) {
              return new Script(scriptPubKeyBytes);
-@@ -1073,7 +1097,7 @@ public class BitcoindClient {
+@@ -1073,17 +1097,30 @@ public class BitcoindClient {
          return null;
      }
  
 -    private void addtoScriptPubKeyCache(Sha256Hash txid, int outputIndex, byte[] scriptPubKeyBytes) {
 +    void addtoScriptPubKeyCache(Sha256Hash txid, int outputIndex, byte[] scriptPubKeyBytes) {
          HashIndex hashIndex = new HashIndex(txid, outputIndex);
-         //Only cache if the length of the field matches one of the valid
-         if(getValidScriptType(scriptPubKeyBytes) != null) {
-@@ -1083,7 +1107,7 @@ public class BitcoindClient {
+-        //Only cache if the length of the field matches one of the valid
+-        if(getValidScriptType(scriptPubKeyBytes) != null) {
++        //Only cache if the length of the field matches one of the valid. A witness v2 to v16 program is kept too: BIP352 skips a
++        //transaction that spends one, and an empty script would hide that from SilentPaymentUtils.spendsInvalidSegwitOutput
++        if(getValidScriptType(scriptPubKeyBytes) != null || isFutureWitnessProgram(scriptPubKeyBytes)) {
+             scriptPubKeyCache.put(hashIndex, scriptPubKeyBytes);
+         } else {
+             scriptPubKeyCache.put(hashIndex, new byte[0]);
          }
      }
  
 -    private static boolean containsTaprootOutput(Transaction tx) {
++    /**
++     * @return true for a witness program of version 2 to 16: OP_2 to OP_16, then a single push of 2 to 40 bytes (BIP141)
++     */
++    static boolean isFutureWitnessProgram(byte[] scriptPubKey) {
++        if(scriptPubKey == null || scriptPubKey.length < 4 || scriptPubKey.length > 42) {
++            return false;
++        }
++        int version = scriptPubKey[0] & 0xff;
++        int push = scriptPubKey[1] & 0xff;
++        return version >= 0x52 && version <= 0x60 && push >= 2 && push <= 40 && push == scriptPubKey.length - 2;
++    }
++
 +    static boolean containsTaprootOutput(Transaction tx) {
          for(TransactionOutput txOutput : tx.getOutputs()) {
              ScriptType scriptType = getValidScriptType(txOutput.getScriptBytes());
@@ -1365,10 +1425,10 @@ index 0000000..7495bcc
 +}
 diff --git a/src/test/java/com/sparrowwallet/frigate/bitcoind/BackfillVerifyTest.java b/src/test/java/com/sparrowwallet/frigate/bitcoind/BackfillVerifyTest.java
 new file mode 100644
-index 0000000..38bebc4
+index 0000000..873052c
 --- /dev/null
 +++ b/src/test/java/com/sparrowwallet/frigate/bitcoind/BackfillVerifyTest.java
-@@ -0,0 +1,103 @@
+@@ -0,0 +1,116 @@
 +package com.sparrowwallet.frigate.bitcoind;
 +
 +import com.sparrowwallet.drongo.protocol.Block;
@@ -1442,6 +1502,19 @@ index 0000000..38bebc4
 +    }
 +
 +    @Test
++    public void refusesASixtyFourByteTransaction() {
++        //a coinbase, then a transaction of exactly 64 bytes: the shape of a Merkle inner node passed off as a leaf
++        HexFormat hex = HexFormat.of();
++        String coinbase = "01000000" + "01" + "00".repeat(32) + "ffffffff" + "02" + "5100" + "ffffffff" + "01" + "0000000000000000" + "00" + "00000000";
++        String sixtyFour = "01000000" + "01" + "11".repeat(32) + "00000000" + "04" + "51515151" + "ffffffff" + "01" + "0000000000000000" + "00" + "00000000";
++        assertEquals(64, sixtyFour.length() / 2);
++        byte[] bytes = hex.parseHex("00000020" + "00".repeat(32) + "00".repeat(32) + "00000000" + "ffff7f20" + "00000000" + "02" + coinbase + sixtyFour);
++        Block block = new Block(bytes);
++        Exception e = assertThrows(IllegalStateException.class, () -> Backfill.verifyBlock(block, block.getHash().toString()));
++        assertTrue(e.getMessage().contains("64 byte"), e.getMessage());
++    }
++
++    @Test
 +    public void merkleRootOfOneLeafIsTheLeaf() {
 +        byte[] leaf = new byte[32];
 +        leaf[0] = 7;
@@ -1470,6 +1543,46 @@ index 0000000..38bebc4
 +            return i;
 +        }
 +        return -1;
++    }
++}
+diff --git a/src/test/java/com/sparrowwallet/frigate/bitcoind/FutureWitnessProgramTest.java b/src/test/java/com/sparrowwallet/frigate/bitcoind/FutureWitnessProgramTest.java
+new file mode 100644
+index 0000000..d81ef71
+--- /dev/null
++++ b/src/test/java/com/sparrowwallet/frigate/bitcoind/FutureWitnessProgramTest.java
+@@ -0,0 +1,34 @@
++package com.sparrowwallet.frigate.bitcoind;
++
++import org.junit.jupiter.api.Test;
++
++import java.util.HexFormat;
++
++import static org.junit.jupiter.api.Assertions.*;
++
++/**
++ * The scriptPubKey cache keeps witness v2 to v16 programs, so BIP352's rule to skip a transaction spending one still applies to a
++ * prevout read from the cache.
++ */
++public class FutureWitnessProgramTest {
++    private static boolean future(String hex) {
++        return BitcoindClient.isFutureWitnessProgram(HexFormat.of().parseHex(hex));
++    }
++
++    @Test
++    public void recognisesVersionsTwoToSixteen() {
++        assertTrue(future("5220" + "11".repeat(32)));
++        assertTrue(future("6002" + "aaaa"));
++        assertTrue(future("5528" + "22".repeat(40)));
++    }
++
++    @Test
++    public void refusesEverythingElse() {
++        assertFalse(future("0014" + "11".repeat(20)), "v0");
++        assertFalse(future("5120" + "11".repeat(32)), "v1 (taproot) is cached as itself already");
++        assertFalse(future("5201" + "aa"), "a 1 byte program");
++        assertFalse(future("5229" + "22".repeat(41)), "a 41 byte program");
++        assertFalse(future("5220" + "11".repeat(31)), "a push longer than the script");
++        assertFalse(future("6a24aa21a9ed" + "00".repeat(32)), "OP_RETURN");
 +    }
 +}
 diff --git a/src/test/java/com/sparrowwallet/frigate/index/IndexBackfillTest.java b/src/test/java/com/sparrowwallet/frigate/index/IndexBackfillTest.java

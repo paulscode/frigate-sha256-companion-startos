@@ -24,8 +24,8 @@ export const chain = {
    */
   chainSplit: null as number | null,
   backfillCost: {
-    trafficGb: '40 to 95',
-    full: '5 to 12 hours',
-    background: '1 to 2 days',
+    trafficGb: '40 to 160',
+    full: '5 to 20 hours',
+    background: '1 to 4 days',
   },
 } as const
