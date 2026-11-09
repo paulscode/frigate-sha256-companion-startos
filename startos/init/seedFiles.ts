@@ -14,7 +14,7 @@ const readOrSetAside = async <T>(read: () => Promise<T>, path: string) => {
     return await read()
   } catch (e) {
     console.warn(
-      `${path} could not be read (${e}); keeping it as ${path}.broken and writing a fresh one`,
+      `${path} could not be read (${String(e)}); keeping it as ${path}.broken and writing a fresh one`,
     )
     await rename(path, `${path}.broken`).catch(() => {})
     return null
