@@ -164,6 +164,15 @@ above). Nothing is ever asked of the node.
 | Sync Progress (`sync-progress`) | index progress, and once synced the block it starts from, plus Look Back progress (`Looking back to block N: ...`, or why it is waiting); failure on `FATAL` (for example a block the node pruned while Frigate was stopped: run Rebuild Index) |
 | Indexer (`indexer`) | the backend chain check: success when the indexer follows the node's chain, failure when it does not |
 
+Every one of those checks goes through `startos/boundedCheck.ts`. start-sdk awaits a check's run
+with no limit, and a stop waits for every check to end (Electrum Server's before Frigate is
+signalled), so one run that never returned would hold up Stop, updates and restarts. These checks
+only read Frigate's log, `/proc/net` and the index's `start-height` file, so they answer in
+milliseconds. A run still pending after a minute is left behind: the check repeats its last
+result twice, then reads *This check has not finished after a minute* (`starting`, never
+`failure`). No second run starts while one is pending, and a run that finishes late is the next
+call's answer.
+
 ## Backups and Restore
 
 The volume is backed up except `db/` (the index), `frigate.log` and its rolled copies, `recentblocks` and a pending `rebuild.request`. A restore rebuilds the index, and with Look Back for Payments on, the new index looks back again.

@@ -2,6 +2,7 @@ import { manifest as bitcoinManifest } from 'bitcoin-core-startos/startos/manife
 import { existsSync } from 'fs'
 import { readFile, rm } from 'fs/promises'
 import { StringDecoder } from 'string_decoder'
+import { bounded, unanswered } from './boundedCheck'
 import {
   config,
   excludedSubnetsForStartosProxy,
@@ -312,7 +313,7 @@ exit "$rc"`,
       },
       ready: {
         display: i18n('Electrum Server'),
-        fn: async () => {
+        fn: bounded(async () => {
           if ((await listening()).result === 'success') {
             return { result: 'success', message: i18n('Frigate is ready') }
           }
@@ -345,14 +346,14 @@ exit "$rc"`,
             }
           }
           return { result: 'starting', message: i18n('Frigate is starting') }
-        },
+        }, unanswered),
       },
       requires: [],
     })
     .addHealthCheck('sync-progress', {
       ready: {
         display: i18n('Sync Progress'),
-        fn: async () => {
+        fn: bounded(async () => {
           const start = await indexStart()
           if ((await listening()).result === 'success') {
             // the node gone for over two minutes while Frigate keeps serving the tip it had
@@ -420,14 +421,14 @@ exit "$rc"`,
             }
           }
           return { result: 'loading', message: i18n('Frigate is syncing...') }
-        },
+        }, unanswered),
       },
       requires: [],
     })
     .addHealthCheck('indexer', {
       ready: {
         display: i18n('Indexer'),
-        fn: async () => {
+        fn: bounded(async () => {
           if (!backend) {
             return {
               result: 'starting',
@@ -475,7 +476,7 @@ exit "$rc"`,
               { indexer: indexer.title, node: node.title },
             ),
           }
-        },
+        }, unanswered),
       },
       requires: [],
     })
