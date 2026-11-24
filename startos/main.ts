@@ -2,7 +2,7 @@ import { manifest as bitcoinManifest } from 'bitcoin-core-startos/startos/manife
 import { existsSync } from 'fs'
 import { readFile, rm } from 'fs/promises'
 import { StringDecoder } from 'string_decoder'
-import { bounded, unanswered } from './boundedCheck'
+import { bounded, unanswered } from './utils'
 import {
   config,
   excludedSubnetsForStartosProxy,
